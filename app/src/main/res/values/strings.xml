@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">Venice AutoPilot</string>
+    <string name="acc_desc">ИИ нажимает на экран вместо тебя</string>
+</resources>
