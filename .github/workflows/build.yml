@@ -24,36 +24,46 @@ jobs:
       - name: Android SDK
         run: |
           SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
-          echo "SDK=$SDK"
           SM="$(ls -d "$SDK"/cmdline-tools/*/bin/sdkmanager 2>/dev/null | head -1)"
           if [ ! -x "$SM" ]; then
-            echo "sdkmanager не найден, качаю cmdline-tools"
             mkdir -p "$SDK/cmdline-tools"
             curl -fsSL https://dl.google.com/android/repository/commandlinetools-linux-latest.zip -o /tmp/ct.zip
             unzip -q /tmp/ct.zip -d /tmp/ct
             mv /tmp/ct/cmdline-tools "$SDK/cmdline-tools/latest"
             SM="$SDK/cmdline-tools/latest/bin/sdkmanager"
           fi
-          echo "sdkmanager=$SM"
           yes | "$SM" --sdk_root="$SDK" --install "platform-tools" "platforms;android-34" "build-tools;34.0.0" || true
           echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
           echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
-          echo "--- платформы ---"; ls "$SDK/platforms" || true
-          echo "--- build-tools ---"; ls "$SDK/build-tools" || true
+          ls "$SDK/platforms" || true
 
-      - name: Создать исходники
+      - name: Создать файлы проекта
         run: bash make.sh .
 
       - name: Собрать APK
-        run: gradle assembleDebug --no-daemon --stacktrace
+        run: |
+          set -o pipefail
+          gradle assembleDebug --no-daemon 2>&1 | tee /tmp/build.log
+
+      - name: Разбор ошибки
+        if: failure()
+        run: |
+          echo "=== ХВОСТ ЛОГА ==="
+          tail -40 /tmp/build.log || true
+          echo "=== КЛЮЧЕВЫЕ СТРОКИ ==="
+          grep -nE "^e: |error:|What went wrong|Execution failed|Could not|Caused by|FAILURE" /tmp/build.log | head -40 || true
+          ERR=$(grep -E "^e: |error:|What went wrong|Execution failed|Could not|Caused by" /tmp/build.log | head -15 | tr '\n' '~' | sed 's/~/%0A/g')
+          echo "::error title=BUILD_ERROR::${ERR}"
 
       - name: Отдать APK
+        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: VeniceAutoPilot-apk
           path: app/build/outputs/apk/debug/*.apk
 
-      - name: Сохранить исходники в репозиторий
+      - name: Сохранить исходники
+        if: always()
         continue-on-error: true
         run: |
           git config user.name "autobuild"
