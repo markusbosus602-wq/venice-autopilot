@@ -89,6 +89,8 @@ object P {
     const val KEEP = "keep"
     const val LAST = "last"
     const val ZONE = "zone"
+    const val TARGET = "target"
+    const val METRIC = "metric"
     const val DEF_BASE = "https://api.venice.ai/api/v1"
     const val DEF_MODEL = "qwen3-vl-235b-a22b"
     fun sp(c: Context) = c.getSharedPreferences(F, Context.MODE_PRIVATE)
@@ -246,7 +248,6 @@ class TouchService : AccessibilityService() {
         return super.onUnbind(i)
     }
 
-    // Следим, какое приложение сейчас на экране — нужно для автопаузы
     override fun onAccessibilityEvent(e: AccessibilityEvent?) {
         if (e == null) return
         if (e.eventType != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) return
@@ -371,6 +372,7 @@ class Brain(private val base: String, private val key: String, private val model
         val think: String = "",
         val acts: List<A> = emptyList(),
         val lvl: Boolean = false,
+        val value: Int = -1,
         val done: Boolean = false,
         val reason: String = "",
         val learn: List<String> = emptyList()
@@ -382,6 +384,7 @@ class Brain(private val base: String, private val key: String, private val model
         root.put("temperature", 0.15)
         root.put("max_tokens", 700)
         root.put("stream", true)
+        if (base.contains("googleapis")) root.put("reasoning_effort", "low")
 
         val msgs = JSONArray()
         msgs.put(JSONObject().put("role", "system").put("content", sys))
@@ -534,6 +537,7 @@ class Brain(private val base: String, private val key: String, private val model
             var done = false
             var reason = ""
             var think = ""
+            var value = -1
             var learn = emptyList<String>()
             if (a in 0 until b) {
                 try {
@@ -542,13 +546,14 @@ class Brain(private val base: String, private val key: String, private val model
                     lvl = j.optBoolean("levelDone", false)
                     done = j.optBoolean("done", false)
                     reason = j.optString("reason", "")
+                    value = j.optInt("value", -1)
                     val arr = j.optJSONArray("learn")
                     if (arr != null) {
                         learn = (0 until arr.length()).map { arr.optString(it) }
                     }
                 } catch (e: Exception) {}
             }
-            return S(think, out, lvl, done, reason, learn)
+            return S(think, out, lvl, value, done, reason, learn)
         }
 
         fun parse(json: String): A? = try {
@@ -740,12 +745,17 @@ class AutoPilotService : Service() {
     private var maxMinutes = 0
     private var maxSteps = 0
 
+    // числовая цель: например "метры прокачки" до 2000
+    private var target = 0
+    private var metric = ""
+    private var hitCount = 0
+    private var lastValue = -1
+
     private var imgW = 1
     private var imgH = 1
     private var scrW = 1
     private var scrH = 1
 
-    // рабочая зона: для сплит-скрина
     private var zoneY0 = 0
     private var viewH = 1
 
@@ -786,6 +796,8 @@ class AutoPilotService : Service() {
         maxLevels = if (intent != null) intent.getIntExtra("maxLevels", 0) else 0
         maxMinutes = if (intent != null) intent.getIntExtra("maxMinutes", 0) else 0
         maxSteps = if (intent != null) intent.getIntExtra("maxSteps", 0) else 0
+        target = if (intent != null) intent.getIntExtra("target", 0) else 0
+        metric = if (intent != null) intent.getStringExtra("metric").orEmpty() else ""
         val dim = if (intent != null) intent.getBooleanExtra("dim", true) else true
         val keep = if (intent != null) intent.getBooleanExtra("keepOn", true) else true
         val rawInterval = if (intent != null) intent.getIntExtra("interval", 900) else 900
@@ -816,10 +828,7 @@ class AutoPilotService : Service() {
         imgW = (scrW / 2).coerceAtLeast(360)
         imgH = (scrH / 2).coerceAtLeast(360)
 
-        zoneY0 = when (zone) {
-            C.ZONE_BOTTOM -> imgH / 2
-            else -> 0
-        }
+        zoneY0 = if (zone == C.ZONE_BOTTOM) imgH / 2 else 0
         viewH = if (zone == C.ZONE_ALL) imgH else (imgH / 2).coerceAtLeast(200)
 
         ovl = Ovl(this)
@@ -866,7 +875,6 @@ class AutoPilotService : Service() {
         return START_NOT_STICKY
     }
 
-    /** Игра сейчас на экране? Если нет — бот ждёт, чтобы не мешать тебе. */
     private fun gameVisible(): Boolean {
         val f = TouchService.foregroundPkg
         if (f.isEmpty()) return true
@@ -875,23 +883,10 @@ class AutoPilotService : Service() {
         return false
     }
 
-    private suspend fun waitForGame() {
-        var first = true
-        while (scope.isActive && running.get() && !gameVisible()) {
-            if (first) {
-                set("игра не на экране — жду")
-                first = false
-            }
-            delay(250)
-        }
-    }
-
     private fun ai(brain: Brain, cadence: Long) {
         actor = scope.launch { actorLoop() }
         thinker = scope.launch { thinkLoop(brain, cadence) }
     }
-
-    private fun actorLoopJob() = scope.launch { actorLoop() }
 
     private suspend fun actorLoop() {
         val sx = scrW.toFloat() / imgW
@@ -955,7 +950,6 @@ class AutoPilotService : Service() {
         if (lvlTaps.size < 200) lvlTaps.add(Mac.T(x, y, d.coerceIn(40, 4000), false))
     }
 
-    /** Вырезает рабочую зону, если включён сплит-режим. */
     private fun zone(f: Bitmap): Bitmap {
         if (viewH >= f.height) return f
         return try {
@@ -1051,7 +1045,13 @@ class AutoPilotService : Service() {
                 )
             } catch (e: Exception) {
                 errors++
-                set("ошибка ИИ ($errors)")
+                val em = e.message ?: ""
+                if (em.contains("429")) {
+                    set("лимит запросов — пауза 10с")
+                    delay(10000)
+                } else {
+                    set("ошибка ИИ ($errors)")
+                }
                 if (errors >= 5 && Mac.load(this, pkg).isNotEmpty()) {
                     set("перехожу на макрос")
                     macro(false)
@@ -1075,6 +1075,21 @@ class AutoPilotService : Service() {
                 levelsLive = levels
                 saveLvl()
                 set("уровней: $levels")
+            }
+
+            // === числовая цель ===
+            if (target > 0 && r.value >= 0) {
+                lastValue = r.value
+                set("$metric: ${r.value} / $target")
+                if (r.value >= target) {
+                    hitCount++
+                    if (hitCount >= 2) {
+                        stopPilot("цель достигнута: $metric = ${r.value}")
+                        return
+                    }
+                } else {
+                    hitCount = 0
+                }
             }
 
             val dl = SystemClock.elapsedRealtime() + 12000
@@ -1166,7 +1181,7 @@ class AutoPilotService : Service() {
         sb.append("Красный крестик — куда ты нажимал в прошлый раз. Промахнулся — исправься.\n")
         sb.append("Панель с надписью AutoPilot сверху слева — интерфейс бота, не игра.\n")
         if (viewH < imgH) {
-            sb.append("Это ВЕРХНЯЯ или НИЖНЯЯ ПОЛОВИНА экрана (сплит-скрин) — координаты считай от верхнего края этой картинки.\n")
+            sb.append("Это половина экрана (сплит-скрин) — координаты считай от верхнего края этой картинки.\n")
         }
         val zr = zoomRect
         if (zr != null) {
@@ -1177,21 +1192,28 @@ class AutoPilotService : Service() {
             sb.append("\n\nЧто ты знаешь об этой игре:\n")
             for (note in n) sb.append("  • ").append(note).append('\n')
         }
-        sb.append("\n\nОТВЕЧАЙ СТРОГО JSON, порядок ключей: think, actions, levelDone, done, reason, learn\n")
-        sb.append("{\"think\":\"что видишь и делаешь\",\"actions\":[{...}],\"levelDone\":false,\"done\":false,\"reason\":\"\",\"learn\":[]}\n\n")
+        sb.append("\n\nОТВЕЧАЙ СТРОГО JSON, порядок ключей: think, actions, levelDone, value, done, reason, learn\n")
+        sb.append("{\"think\":\"что видишь и делаешь\",\"actions\":[{...}],\"levelDone\":false,\"value\":-1,\"done\":false,\"reason\":\"\",\"learn\":[]}\n\n")
         sb.append("Действия: tap {x,y} | double {x,y} | long {x,y,ms} | swipe {x,y,x2,y2,ms} | drag {x,y,x2,y2} | wait {ms} | back | restart\n\n")
+        if (target > 0) {
+            sb.append("=== ГЛАВНАЯ ЧИСЛОВАЯ ЦЕЛЬ ===\n")
+            sb.append("Показатель, за которым надо следить: «$metric». Целевое значение: $target.\n")
+            sb.append("В КАЖДОМ ответе заполняй поле \"value\" — текущее значение этого показателя, ТОЛЬКО ЦИФРЫ, без букв, пробелов и знаков (например 1240). Если показатель на экране не виден — \"value\": -1.\n")
+            sb.append("Играй так, чтобы этот показатель рос: зарабатывай ресурсы и трать их на прокачку именно этого показателя. Если показатель уменьшился (потратил) — не паникуй, это нормально, но следи, чтобы он в итоге рос.\n")
+            sb.append("Когда показатель станет $target или больше — поставь \"done\": true и в \"reason\" напиши достигнутое значение.\n\n")
+        }
         sb.append("ПРАВИЛА:\n")
         sb.append("1. Координаты в пикселях картинки 1, (0,0) слева сверху. Сверяйся с сеткой.\n")
         sb.append("2. Обычно 1–3 действия, до 6 только для связки. Действия выполняются сразу по мере выхода JSON.\n")
         sb.append("3. Тап не изменил экран — промахнулся. Смотри на крестик и картинку 2 (зум), тапни точнее.\n")
         sb.append("4. Загрузка/анимация → wait 1200.\n")
         sb.append("5. Уровень пройден → levelDone true и тапни Next/Continue.\n")
-        sb.append("6. Реклама → закрой крестиком или «Пропустить». Реклама не конец уровня.\n")
+        sb.append("6. Реклама → закрой крестиком или «Пропустить». Реклама не конец уровня. Реклама за награду — смотри и забирай награду.\n")
         sb.append("7. Проигрыш → тапни Retry/Заново.\n")
         sb.append("8. Цель выполнена → done true и в reason что сделано.\n")
         sb.append("9. Новую закономерность пиши в learn. Не дублируй.\n")
         sb.append("10. Пустой actions не возвращай: не уверен — wait.\n")
-        sb.append("11. Приоритеты как у профи: выживание, прогресс, бонусы.\n")
+        sb.append("11. Приоритеты как у профи: выживание, прогресс, бонусы. Прокачку не забывай — заходи в меню апгрейдов, когда есть ресурсы.\n")
         return sb.toString()
     }
 
@@ -1199,6 +1221,7 @@ class AutoPilotService : Service() {
         val sb = StringBuilder()
         if (goal.isNotBlank()) sb.append("ЦЕЛЬ: $goal\n")
         sb.append("Шаг $steps, уровней пройдено: $levels\n")
+        if (target > 0) sb.append("Текущий $metric: $lastValue (цель $target)\n")
         if (noOp > 0) sb.append("ВНИМАНИЕ: последние $noOp тапов не изменили экран.\n")
         if (hist.isNotEmpty()) {
             sb.append("Прошлые шаги:\n")
@@ -1300,9 +1323,9 @@ class AutoPilotService : Service() {
         try {
             val v = getSystemService(Vibrator::class.java)
             if (Build.VERSION.SDK_INT >= 26) {
-                v.vibrate(VibrationEffect.createOneShot(200L, 128))
+                v.vibrate(VibrationEffect.createOneShot(600L, 128))
             } else {
-                v.vibrate(200L)
+                v.vibrate(600L)
             }
         } catch (e: Throwable) {}
         hardStop()
@@ -1359,6 +1382,8 @@ class MainActivity : Activity() {
     private lateinit var maxL: EditText
     private lateinit var maxM: EditText
     private lateinit var maxS: EditText
+    private lateinit var targetField: EditText
+    private lateinit var metricField: EditText
     private lateinit var onlyGames: CheckBox
     private lateinit var dimBox: CheckBox
     private lateinit var keepBox: CheckBox
@@ -1417,7 +1442,7 @@ class MainActivity : Activity() {
         model = EditText(this)
         model.hint = "vision-модель"
         goalField = EditText(this)
-        goalField.hint = "Цель: пройти 10 уровней, фармить золото…"
+        goalField.hint = "Цель словами: фарми золото, качай метры…"
         col.addView(api)
         col.addView(base)
         col.addView(model)
@@ -1495,6 +1520,20 @@ class MainActivity : Activity() {
         r4.addView(maxS)
         col.addView(r4)
 
+        val r4b = LinearLayout(this)
+        r4b.gravity = Gravity.CENTER_VERTICAL
+        r4b.addView(txt("ЦЕЛЬ ПО ЧИСЛУ (0 = выкл):", 14f, false))
+        targetField = EditText(this)
+        targetField.setText("0")
+        targetField.width = 230
+        r4b.addView(targetField)
+        r4b.addView(txt("что за число:", 14f, false))
+        metricField = EditText(this)
+        metricField.hint = "метры / золото / монеты"
+        metricField.width = 380
+        r4b.addView(metricField)
+        col.addView(r4b)
+
         status = txt("статус: не запущен", 13f, false)
         col.addView(status)
 
@@ -1524,6 +1563,8 @@ class MainActivity : Activity() {
         model.setText(sp.getString(P.MODEL, P.DEF_MODEL))
         goalField.setText(sp.getString(P.GOAL, ""))
         ivl.setText(sp.getInt(P.IVL, 900).toString())
+        targetField.setText(sp.getInt(P.TARGET, 0).toString())
+        metricField.setText(sp.getString(P.METRIC, ""))
         dimBox.isChecked = sp.getBoolean(P.DIM, true)
         keepBox.isChecked = sp.getBoolean(P.KEEP, true)
         when (sp.getInt(P.ZONE, C.ZONE_ALL)) {
@@ -1654,6 +1695,11 @@ class MainActivity : Activity() {
             toast("Макроса нет — сначала запиши")
             return
         }
+        val t = targetField.text.toString().toIntOrNull() ?: 0
+        if (t > 0 && metricField.text.toString().trim().isEmpty()) {
+            toast("Напиши, что за число (метры, золото…)")
+            return
+        }
         save()
         pend = m
         val mpm = getSystemService(MediaProjectionManager::class.java)
@@ -1677,6 +1723,8 @@ class MainActivity : Activity() {
             i.putExtra("maxLevels", maxL.text.toString().toIntOrNull() ?: 0)
             i.putExtra("maxMinutes", maxM.text.toString().toIntOrNull() ?: 0)
             i.putExtra("maxSteps", maxS.text.toString().toIntOrNull() ?: 0)
+            i.putExtra("target", targetField.text.toString().toIntOrNull() ?: 0)
+            i.putExtra("metric", metricField.text.toString().trim())
             i.putExtra("dim", dimBox.isChecked)
             i.putExtra("keepOn", keepBox.isChecked)
             i.putExtra("zone", currentZone())
@@ -1697,6 +1745,8 @@ class MainActivity : Activity() {
             .putBoolean(P.DIM, dimBox.isChecked)
             .putBoolean(P.KEEP, keepBox.isChecked)
             .putInt(P.ZONE, currentZone())
+            .putInt(P.TARGET, targetField.text.toString().toIntOrNull() ?: 0)
+            .putString(P.METRIC, metricField.text.toString().trim())
             .apply()
     }
 
