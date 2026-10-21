@@ -88,6 +88,7 @@ object P {
     const val DIM = "dim"
     const val KEEP = "keep"
     const val LAST = "last"
+    const val ZONE = "zone"
     const val DEF_BASE = "https://api.venice.ai/api/v1"
     const val DEF_MODEL = "qwen3-vl-235b-a22b"
     fun sp(c: Context) = c.getSharedPreferences(F, Context.MODE_PRIVATE)
@@ -99,6 +100,9 @@ object C {
     const val MODE_HYBRID = 2
     const val MODE_RECORD = 3
     const val MODE_SPEED = 4
+    const val ZONE_ALL = 0
+    const val ZONE_TOP = 1
+    const val ZONE_BOTTOM = 2
     const val START = "ai.venice.autopilot.START"
     const val STOP = "ai.venice.autopilot.STOP"
 }
@@ -220,8 +224,10 @@ fun Bitmap.toJpg(q: Int = 70): ByteArray {
 // ==================== Тапы ====================
 
 class TouchService : AccessibilityService() {
+
     companion object {
         @Volatile var inst: TouchService? = null
+        @Volatile var foregroundPkg: String = ""
         val ok: Boolean get() = inst != null
     }
 
@@ -240,7 +246,14 @@ class TouchService : AccessibilityService() {
         return super.onUnbind(i)
     }
 
-    override fun onAccessibilityEvent(e: AccessibilityEvent?) {}
+    // Следим, какое приложение сейчас на экране — нужно для автопаузы
+    override fun onAccessibilityEvent(e: AccessibilityEvent?) {
+        if (e == null) return
+        if (e.eventType != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) return
+        val p = e.packageName
+        if (p != null && p.isNotEmpty()) foregroundPkg = p.toString()
+    }
+
     override fun onInterrupt() {}
 
     override fun onKeyEvent(e: KeyEvent): Boolean {
@@ -732,6 +745,10 @@ class AutoPilotService : Service() {
     private var scrW = 1
     private var scrH = 1
 
+    // рабочая зона: для сплит-скрина
+    private var zoneY0 = 0
+    private var viewH = 1
+
     private var startedAt = 0L
     private var levels = 0
     private var steps = 0
@@ -739,6 +756,7 @@ class AutoPilotService : Service() {
     private var lastFrameAt = 0L
     private var black = 0
     private var stopped = false
+    private var awayNotified = false
 
     private var lastTap: Pair<Int, Int>? = null
     private var zoomRect: IntArray? = null
@@ -772,6 +790,7 @@ class AutoPilotService : Service() {
         val keep = if (intent != null) intent.getBooleanExtra("keepOn", true) else true
         val rawInterval = if (intent != null) intent.getIntExtra("interval", 900) else 900
         val cadence = rawInterval.toLong().coerceIn(300L, 5000L)
+        val zone = if (intent != null) intent.getIntExtra("zone", C.ZONE_ALL) else C.ZONE_ALL
 
         if (data == null || pkg.isEmpty()) {
             stopSelf()
@@ -796,6 +815,12 @@ class AutoPilotService : Service() {
         }
         imgW = (scrW / 2).coerceAtLeast(360)
         imgH = (scrH / 2).coerceAtLeast(360)
+
+        zoneY0 = when (zone) {
+            C.ZONE_BOTTOM -> imgH / 2
+            else -> 0
+        }
+        viewH = if (zone == C.ZONE_ALL) imgH else (imgH / 2).coerceAtLeast(200)
 
         ovl = Ovl(this)
         ovl?.showDim(if (dim) 0.03f else 1f, keep)
@@ -841,38 +866,73 @@ class AutoPilotService : Service() {
         return START_NOT_STICKY
     }
 
+    /** Игра сейчас на экране? Если нет — бот ждёт, чтобы не мешать тебе. */
+    private fun gameVisible(): Boolean {
+        val f = TouchService.foregroundPkg
+        if (f.isEmpty()) return true
+        if (f == pkg) return true
+        if (f == packageName) return true
+        return false
+    }
+
+    private suspend fun waitForGame() {
+        var first = true
+        while (scope.isActive && running.get() && !gameVisible()) {
+            if (first) {
+                set("игра не на экране — жду")
+                first = false
+            }
+            delay(250)
+        }
+    }
+
     private fun ai(brain: Brain, cadence: Long) {
         actor = scope.launch { actorLoop() }
         thinker = scope.launch { thinkLoop(brain, cadence) }
     }
+
+    private fun actorLoopJob() = scope.launch { actorLoop() }
 
     private suspend fun actorLoop() {
         val sx = scrW.toFloat() / imgW
         val sy = scrH.toFloat() / imgH
         while (scope.isActive) {
             val a = queue.receive()
+            var waited = 0L
+            while (scope.isActive && !gameVisible() && waited < 3000L) {
+                delay(150)
+                waited += 150
+            }
             while (paused && running.get()) delay(80)
             if (!running.get()) return
             val t = TouchService.inst
             when (a.t) {
                 "tap" -> {
-                    if (t != null) t.tap(a.x * sx, a.y * sy)
+                    if (t != null) t.tap(a.x * sx, (a.y + zoneY0) * sy)
                     note(a.x, a.y)
                 }
                 "double" -> {
-                    if (t != null) t.doubleTap(a.x * sx, a.y * sy)
+                    if (t != null) t.doubleTap(a.x * sx, (a.y + zoneY0) * sy)
                     note(a.x, a.y)
                 }
                 "long" -> {
-                    if (t != null) t.tap(a.x * sx, a.y * sy, a.ms.toLong().coerceIn(200L, 4000L))
+                    if (t != null) t.tap(a.x * sx, (a.y + zoneY0) * sy, a.ms.toLong().coerceIn(200L, 4000L))
                     note(a.x, a.y)
                 }
                 "swipe" -> {
-                    if (t != null) t.swipe(a.x * sx, a.y * sy, a.x2 * sx, a.y2 * sy, a.ms.toLong().coerceIn(80L, 2000L))
+                    if (t != null) {
+                        t.swipe(
+                            a.x * sx, (a.y + zoneY0) * sy,
+                            a.x2 * sx, (a.y2 + zoneY0) * sy,
+                            a.ms.toLong().coerceIn(80L, 2000L)
+                        )
+                    }
                     note(a.x, a.y)
                 }
                 "drag" -> {
-                    if (t != null) t.drag(a.x * sx, a.y * sy, a.x2 * sx, a.y2 * sy)
+                    if (t != null) {
+                        t.drag(a.x * sx, (a.y + zoneY0) * sy, a.x2 * sx, (a.y2 + zoneY0) * sy)
+                    }
                     note(a.x, a.y)
                 }
                 "wait" -> delay(a.ms.toLong().coerceIn(100L, 5000L))
@@ -895,6 +955,16 @@ class AutoPilotService : Service() {
         if (lvlTaps.size < 200) lvlTaps.add(Mac.T(x, y, d.coerceIn(40, 4000), false))
     }
 
+    /** Вырезает рабочую зону, если включён сплит-режим. */
+    private fun zone(f: Bitmap): Bitmap {
+        if (viewH >= f.height) return f
+        return try {
+            Bitmap.createBitmap(f, 0, zoneY0, f.width, viewH)
+        } catch (e: Throwable) {
+            f
+        }
+    }
+
     private suspend fun thinkLoop(brain: Brain, cadence: Long) {
         var lastSig = 0L
         var idle = 0
@@ -914,13 +984,25 @@ class AutoPilotService : Service() {
                 return
             }
 
-            val f = cap?.frame()
-            if (f == null) {
+            if (!gameVisible()) {
+                if (!awayNotified) {
+                    set("игра не на экране — жду")
+                    awayNotified = true
+                }
+                delay(300)
+                continue
+            }
+            awayNotified = false
+
+            val full = cap?.frame()
+            if (full == null) {
                 if (SystemClock.elapsedRealtime() - lastFrameAt > 7000) cap?.recreate()
                 delay(250)
                 continue
             }
             lastFrameAt = SystemClock.elapsedRealtime()
+
+            val f = zone(full)
 
             val cur = signature(f)
             if (cur == 0L) black++ else black = 0
@@ -999,7 +1081,7 @@ class AutoPilotService : Service() {
             while (pending.get() > 0 && SystemClock.elapsedRealtime() < dl) delay(40)
             delay(220)
 
-            val after = cap?.frame()?.let { signature(it) } ?: 0L
+            val after = cap?.frame()?.let { signature(zone(it)) } ?: 0L
             var hadTap = false
             for (a in r.acts) {
                 if (a.t == "tap" || a.t == "double" || a.t == "long" || a.t == "swipe" || a.t == "drag") {
@@ -1030,10 +1112,10 @@ class AutoPilotService : Service() {
 
     private fun zoom(f: Bitmap, p: Pair<Int, Int>): ByteArray? {
         return try {
-            val rw = (imgW * 0.45f).toInt().coerceAtLeast(200)
-            val rh = (imgH * 0.45f).toInt().coerceAtLeast(200)
-            val x = (p.first - rw / 2).coerceIn(0, (imgW - rw).coerceAtLeast(1))
-            val y = (p.second - rh / 2).coerceIn(0, (imgH - rh).coerceAtLeast(1))
+            val rw = (f.width * 0.45f).toInt().coerceAtLeast(200)
+            val rh = (f.height * 0.45f).toInt().coerceAtLeast(200)
+            val x = (p.first - rw / 2).coerceIn(0, (f.width - rw).coerceAtLeast(1))
+            val y = (p.second - rh / 2).coerceIn(0, (f.height - rh).coerceAtLeast(1))
             zoomRect = intArrayOf(x, y, rw, rh)
             val c = Bitmap.createBitmap(f, x, y, rw, rh)
             val up = Bitmap.createScaledBitmap(
@@ -1064,6 +1146,7 @@ class AutoPilotService : Service() {
             while (isActive && running.get()) {
                 for (t in m) {
                     while (paused && running.get()) delay(80)
+                    while (isActive && running.get() && !gameVisible()) delay(250)
                     if (!running.get()) return@launch
                     val ts = TouchService.inst ?: break
                     if (t.l) ts.tap(t.x.toFloat(), t.y.toFloat(), 500L)
@@ -1078,10 +1161,13 @@ class AutoPilotService : Service() {
     private fun system(): String {
         val sb = StringBuilder()
         sb.append("Ты — лучший игрок в мире и играешь в мобильную игру на Android, управляя только касаниями.\n")
-        sb.append("Кадр игры приходит картинкой ${imgW}x${imgH}. Игра: $pkg\n\n")
+        sb.append("Кадр игры приходит картинкой ${imgW}x${viewH}. Игра: $pkg\n\n")
         sb.append("На картинке нарисована БИРЮЗОВАЯ СЕТКА с числами по краям — это пиксельные координаты. Сверяйся с ней.\n")
         sb.append("Красный крестик — куда ты нажимал в прошлый раз. Промахнулся — исправься.\n")
         sb.append("Панель с надписью AutoPilot сверху слева — интерфейс бота, не игра.\n")
+        if (viewH < imgH) {
+            sb.append("Это ВЕРХНЯЯ или НИЖНЯЯ ПОЛОВИНА экрана (сплит-скрин) — координаты считай от верхнего края этой картинки.\n")
+        }
         val zr = zoomRect
         if (zr != null) {
             sb.append("\nКартинка 2 — увеличенный фрагмент области x=${zr[0]}..${zr[0] + zr[2]}, y=${zr[1]}..${zr[1] + zr[3]} в координатах картинки 1. Координаты указывай в системе картинки 1.")
@@ -1178,7 +1264,7 @@ class AutoPilotService : Service() {
         return Notification.Builder(this, "ap")
             .setContentTitle("Venice AutoPilot")
             .setContentText(text)
-            .setSmallIcon(android.R.drawable.ic_menu_play_clip)
+            .setSmallIcon(android.R.drawable.ic_media_play)
             .addAction(Notification.Action.Builder(0, "Стоп", stop).build())
             .setOngoing(true)
             .build()
@@ -1277,6 +1363,7 @@ class MainActivity : Activity() {
     private lateinit var dimBox: CheckBox
     private lateinit var keepBox: CheckBox
     private lateinit var modes: RadioGroup
+    private lateinit var zones: RadioGroup
 
     override fun onCreate(s: Bundle?) {
         super.onCreate(s)
@@ -1286,6 +1373,7 @@ class MainActivity : Activity() {
 
         col.addView(txt("Venice AutoPilot", 22f, true))
         col.addView(txt("1) разрешения  2) выбери игру  3) СТАРТ", 12f, false))
+        col.addView(txt("Бот сам встаёт на паузу, когда ты выходишь из игры.", 11f, false))
 
         val r1 = LinearLayout(this)
         val bAcc = Button(this)
@@ -1355,6 +1443,22 @@ class MainActivity : Activity() {
         modes.addView(mSpd)
         col.addView(modes)
 
+        zones = RadioGroup(this)
+        val zAll = RadioButton(this)
+        zAll.text = "зона: весь экран"
+        zAll.id = 11
+        zAll.isChecked = true
+        val zTop = RadioButton(this)
+        zTop.text = "зона: верхняя половина (сплит)"
+        zTop.id = 12
+        val zBot = RadioButton(this)
+        zBot.text = "зона: нижняя половина (сплит)"
+        zBot.id = 13
+        zones.addView(zAll)
+        zones.addView(zTop)
+        zones.addView(zBot)
+        col.addView(zones)
+
         val r3 = LinearLayout(this)
         r3.gravity = Gravity.CENTER_VERTICAL
         r3.addView(txt("интервал, мс:", 14f, false))
@@ -1422,6 +1526,11 @@ class MainActivity : Activity() {
         ivl.setText(sp.getInt(P.IVL, 900).toString())
         dimBox.isChecked = sp.getBoolean(P.DIM, true)
         keepBox.isChecked = sp.getBoolean(P.KEEP, true)
+        when (sp.getInt(P.ZONE, C.ZONE_ALL)) {
+            C.ZONE_TOP -> zones.check(12)
+            C.ZONE_BOTTOM -> zones.check(13)
+            else -> zones.check(11)
+        }
 
         bAcc.setOnClickListener {
             startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
@@ -1488,6 +1597,12 @@ class MainActivity : Activity() {
         3 -> C.MODE_HYBRID
         4 -> C.MODE_SPEED
         else -> C.MODE_AI
+    }
+
+    private fun currentZone(): Int = when (zones.checkedRadioButtonId) {
+        12 -> C.ZONE_TOP
+        13 -> C.ZONE_BOTTOM
+        else -> C.ZONE_ALL
     }
 
     private fun load() {
@@ -1564,6 +1679,7 @@ class MainActivity : Activity() {
             i.putExtra("maxSteps", maxS.text.toString().toIntOrNull() ?: 0)
             i.putExtra("dim", dimBox.isChecked)
             i.putExtra("keepOn", keepBox.isChecked)
+            i.putExtra("zone", currentZone())
             startForegroundService(i)
             toast("Бот запущен")
         } else if (req == 1001) {
@@ -1580,6 +1696,7 @@ class MainActivity : Activity() {
             .putInt(P.IVL, ivl.text.toString().toIntOrNull() ?: 900)
             .putBoolean(P.DIM, dimBox.isChecked)
             .putBoolean(P.KEEP, keepBox.isChecked)
+            .putInt(P.ZONE, currentZone())
             .apply()
     }
 
