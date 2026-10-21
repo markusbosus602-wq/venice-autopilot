@@ -38,6 +38,8 @@ import android.os.SystemClock
 import android.os.VibrationEffect
 import android.os.Vibrator
 import android.provider.Settings
+import android.text.Editable
+import android.text.TextWatcher
 import android.util.Base64
 import android.util.DisplayMetrics
 import android.view.Gravity
@@ -745,7 +747,6 @@ class AutoPilotService : Service() {
     private var maxMinutes = 0
     private var maxSteps = 0
 
-    // числовая цель: например "метры прокачки" до 2000
     private var target = 0
     private var metric = ""
     private var hitCount = 0
@@ -1077,7 +1078,6 @@ class AutoPilotService : Service() {
                 set("уровней: $levels")
             }
 
-            // === числовая цель ===
             if (target > 0 && r.value >= 0) {
                 lastValue = r.value
                 set("$metric: ${r.value} / $target")
@@ -1368,9 +1368,12 @@ class MainActivity : Activity() {
     private val sp by lazy { P.sp(this) }
     private var sel: String? = null
     private var pend = C.MODE_AI
-    private val apps = ArrayList<AppEntry>()
+
+    private val allApps = ArrayList<AppEntry>()
+    private val shown = ArrayList<AppEntry>()
 
     private lateinit var list: ListView
+    private lateinit var search: EditText
     private lateinit var count: TextView
     private lateinit var selLabel: TextView
     private lateinit var status: TextView
@@ -1389,16 +1392,90 @@ class MainActivity : Activity() {
     private lateinit var keepBox: CheckBox
     private lateinit var modes: RadioGroup
     private lateinit var zones: RadioGroup
+    private lateinit var gamesPane: LinearLayout
+    private lateinit var setPane: ScrollView
 
     override fun onCreate(s: Bundle?) {
         super.onCreate(s)
-        val col = LinearLayout(this)
-        col.orientation = LinearLayout.VERTICAL
-        col.setPadding(20, 20, 20, 20)
 
-        col.addView(txt("Venice AutoPilot", 22f, true))
-        col.addView(txt("1) разрешения  2) выбери игру  3) СТАРТ", 12f, false))
-        col.addView(txt("Бот сам встаёт на паузу, когда ты выходишь из игры.", 11f, false))
+        val root = LinearLayout(this)
+        root.orientation = LinearLayout.VERTICAL
+        root.setPadding(16, 16, 16, 16)
+
+        root.addView(txt("Venice AutoPilot", 20f, true))
+
+        val tabs = LinearLayout(this)
+        val bGames = Button(this)
+        bGames.text = "Список игр"
+        val bSet = Button(this)
+        bSet.text = "Настройки"
+        tabs.addView(bGames, wlp(1f))
+        tabs.addView(bSet, wlp(1f))
+        root.addView(tabs)
+
+        // ---------- ПАНЕЛЬ ИГР ----------
+        gamesPane = LinearLayout(this)
+        gamesPane.orientation = LinearLayout.VERTICAL
+
+        search = EditText(this)
+        search.hint = "поиск игры"
+        search.setSingleLine(true)
+        search.addTextChangedListener(object : TextWatcher {
+            override fun afterTextChanged(s: Editable?) { applyFilter() }
+            override fun beforeTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
+            override fun onTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
+        })
+        gamesPane.addView(search)
+
+        onlyGames = CheckBox(this)
+        onlyGames.text = "только игры"
+        onlyGames.isChecked = true
+        count = txt("", 12f, false)
+        val rowFilter = LinearLayout(this)
+        rowFilter.gravity = Gravity.CENTER_VERTICAL
+        rowFilter.addView(onlyGames)
+        rowFilter.addView(count)
+        gamesPane.addView(rowFilter)
+
+        list = ListView(this)
+        list.adapter = Adapter()
+        list.isFastScrollEnabled = true
+        list.setPadding(0, 8, 0, 8)
+        list.setOnItemClickListener { _, _, pos, _ ->
+            val e = shown[pos]
+            sel = e.pkg
+            selLabel.text = "Выбрано: ${e.label}"
+            goalField.setText(Mem.goal(this, e.pkg))
+            sp.edit().putString(P.LAST, e.pkg).apply()
+            val a = list.adapter
+            if (a is Adapter) a.notifyDataSetChanged()
+        }
+        gamesPane.addView(list, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f
+        ))
+
+        selLabel = txt("Выбрано: —", 14f, true)
+        gamesPane.addView(selLabel)
+
+        status = txt("статус: не запущен", 12f, false)
+        gamesPane.addView(status)
+
+        val rowRun = LinearLayout(this)
+        val bStart = Button(this)
+        bStart.text = "СТАРТ"
+        val bStop = Button(this)
+        bStop.text = "СТОП"
+        rowRun.addView(bStart, wlp(1f))
+        rowRun.addView(bStop, wlp(1f))
+        gamesPane.addView(rowRun)
+
+        root.addView(gamesPane, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f
+        ))
+
+        // ---------- ПАНЕЛЬ НАСТРОЕК ----------
+        val setCol = LinearLayout(this)
+        setCol.orientation = LinearLayout.VERTICAL
 
         val r1 = LinearLayout(this)
         val bAcc = Button(this)
@@ -1407,33 +1484,7 @@ class MainActivity : Activity() {
         bOvl.text = "Поверх окон"
         r1.addView(bAcc, wlp(1f))
         r1.addView(bOvl, wlp(1f))
-        col.addView(r1)
-
-        onlyGames = CheckBox(this)
-        onlyGames.text = "только игры"
-        onlyGames.isChecked = true
-        count = txt("", 12f, false)
-        val r2 = LinearLayout(this)
-        r2.gravity = Gravity.CENTER_VERTICAL
-        r2.addView(onlyGames)
-        r2.addView(count)
-        col.addView(r2)
-
-        list = ListView(this)
-        list.adapter = Adapter()
-        list.setOnItemClickListener { _, _, pos, _ ->
-            val e = apps[pos]
-            sel = e.pkg
-            selLabel.text = "Выбрано: ${e.label}"
-            goalField.setText(Mem.goal(this, e.pkg))
-            sp.edit().putString(P.LAST, e.pkg).apply()
-            val a = list.adapter
-            if (a is Adapter) a.notifyDataSetChanged()
-        }
-        col.addView(list, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 700))
-
-        selLabel = txt("Выбрано: —", 14f, true)
-        col.addView(selLabel)
+        setCol.addView(r1)
 
         api = EditText(this)
         api.hint = "Venice API key"
@@ -1443,10 +1494,10 @@ class MainActivity : Activity() {
         model.hint = "vision-модель"
         goalField = EditText(this)
         goalField.hint = "Цель словами: фарми золото, качай метры…"
-        col.addView(api)
-        col.addView(base)
-        col.addView(model)
-        col.addView(goalField)
+        setCol.addView(api)
+        setCol.addView(base)
+        setCol.addView(model)
+        setCol.addView(goalField)
 
         modes = RadioGroup(this)
         val mAi = RadioButton(this)
@@ -1466,7 +1517,7 @@ class MainActivity : Activity() {
         modes.addView(mMac)
         modes.addView(mHyb)
         modes.addView(mSpd)
-        col.addView(modes)
+        setCol.addView(modes)
 
         zones = RadioGroup(this)
         val zAll = RadioButton(this)
@@ -1482,7 +1533,7 @@ class MainActivity : Activity() {
         zones.addView(zAll)
         zones.addView(zTop)
         zones.addView(zBot)
-        col.addView(zones)
+        setCol.addView(zones)
 
         val r3 = LinearLayout(this)
         r3.gravity = Gravity.CENTER_VERTICAL
@@ -1499,7 +1550,7 @@ class MainActivity : Activity() {
         keepBox.isChecked = true
         r3.addView(dimBox)
         r3.addView(keepBox)
-        col.addView(r3)
+        setCol.addView(r3)
 
         val r4 = LinearLayout(this)
         r4.gravity = Gravity.CENTER_VERTICAL
@@ -1518,7 +1569,7 @@ class MainActivity : Activity() {
         maxS.setText("0")
         maxS.width = 170
         r4.addView(maxS)
-        col.addView(r4)
+        setCol.addView(r4)
 
         val r4b = LinearLayout(this)
         r4b.gravity = Gravity.CENTER_VERTICAL
@@ -1532,31 +1583,38 @@ class MainActivity : Activity() {
         metricField.hint = "метры / золото / монеты"
         metricField.width = 380
         r4b.addView(metricField)
-        col.addView(r4b)
+        setCol.addView(r4b)
 
-        status = txt("статус: не запущен", 13f, false)
-        col.addView(status)
-
-        val r5 = LinearLayout(this)
+        val rowBtns = LinearLayout(this)
         val bTest = Button(this)
         bTest.text = "Тест API"
         val bRec = Button(this)
-        bRec.text = "Запись"
-        val bStart = Button(this)
-        bStart.text = "СТАРТ"
-        val bStop = Button(this)
-        bStop.text = "СТОП"
-        r5.addView(bTest, wlp(1f))
-        r5.addView(bRec, wlp(1f))
-        r5.addView(bStart, wlp(1f))
-        r5.addView(bStop, wlp(1f))
-        col.addView(r5)
+        bRec.text = "Запись макроса"
+        rowBtns.addView(bTest, wlp(1f))
+        rowBtns.addView(bRec, wlp(1f))
+        setCol.addView(rowBtns)
 
         val bMem = Button(this)
         bMem.text = "Сбросить память игры"
-        col.addView(bMem)
+        setCol.addView(bMem)
 
-        setContentView(ScrollView(this).apply { addView(col) })
+        setPane = ScrollView(this)
+        setPane.addView(setCol)
+        setPane.visibility = View.GONE
+        root.addView(setPane, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f
+        ))
+
+        setContentView(root)
+
+        bGames.setOnClickListener {
+            gamesPane.visibility = View.VISIBLE
+            setPane.visibility = View.GONE
+        }
+        bSet.setOnClickListener {
+            gamesPane.visibility = View.GONE
+            setPane.visibility = View.VISIBLE
+        }
 
         api.setText(sp.getString(P.API, ""))
         base.setText(sp.getString(P.BASE, P.DEF_BASE))
@@ -1614,7 +1672,7 @@ class MainActivity : Activity() {
                 status.text = if (AutoPilotService.inst == null) {
                     "статус: не запущен"
                 } else {
-                    "статус: работает, шагов ${AutoPilotService.stepsLive}, уровней ${AutoPilotService.levelsLive}"
+                    "работает: шагов ${AutoPilotService.stepsLive}, уровней ${AutoPilotService.levelsLive}"
                 }
                 h.postDelayed(this, 700)
             }
@@ -1646,6 +1704,20 @@ class MainActivity : Activity() {
         else -> C.ZONE_ALL
     }
 
+    private fun applyFilter() {
+        val q = search.text.toString().trim().lowercase()
+        shown.clear()
+        for (e in allApps) {
+            if (q.isEmpty() || e.label.lowercase().contains(q) || e.pkg.lowercase().contains(q)) {
+                shown.add(e)
+            }
+        }
+        val a = list.adapter
+        if (a is Adapter) a.notifyDataSetChanged()
+        count.text = if (q.isEmpty()) "всего: ${allApps.size}"
+        else "найдено: ${shown.size} из ${allApps.size}"
+    }
+
     private fun load() {
         val only = onlyGames.isChecked
         Thread {
@@ -1659,11 +1731,9 @@ class MainActivity : Activity() {
                 AppEntry(ai.packageName, ai.loadLabel(pm).toString(), ai.loadIcon(pm))
             }.distinctBy { it.pkg }.sortedBy { it.label.lowercase() }
             runOnUiThread {
-                apps.clear()
-                apps.addAll(found)
-                val a = list.adapter
-                if (a is Adapter) a.notifyDataSetChanged()
-                count.text = "найдено: ${found.size}"
+                allApps.clear()
+                allApps.addAll(found)
+                applyFilter()
                 val last = sp.getString(P.LAST, null)
                 if (last != null) {
                     val f = found.firstOrNull { it.pkg == last }
@@ -1773,11 +1843,11 @@ class MainActivity : Activity() {
     }
 
     private inner class Adapter : BaseAdapter() {
-        override fun getCount() = apps.size
-        override fun getItem(p: Int): Any = apps[p]
+        override fun getCount() = shown.size
+        override fun getItem(p: Int): Any = shown[p]
         override fun getItemId(p: Int) = p.toLong()
         override fun getView(p: Int, v: View?, parent: ViewGroup?): View {
-            val e = apps[p]
+            val e = shown[p]
             val row = LinearLayout(this@MainActivity)
             row.orientation = LinearLayout.HORIZONTAL
             row.gravity = Gravity.CENTER_VERTICAL
