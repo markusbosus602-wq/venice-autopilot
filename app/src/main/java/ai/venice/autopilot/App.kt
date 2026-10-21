@@ -84,7 +84,7 @@ object P {
     const val F = "autopilot"
     const val API = "api"
     const val BASE = "base"
-    const val MODEL = "model"
+    const val MODE = "mode"
     const val GOAL = "goal"
     const val RULES = "rules"
     const val ADS = "ads"
