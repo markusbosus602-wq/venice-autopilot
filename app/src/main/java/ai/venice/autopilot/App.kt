@@ -78,7 +78,7 @@ import java.net.URL
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 
-// ==================== Настройки ====================
+// ==================== Настройки (всё хранится на диске) ====================
 
 object P {
     const val F = "autopilot"
@@ -86,6 +86,8 @@ object P {
     const val BASE = "base"
     const val MODEL = "model"
     const val GOAL = "goal"
+    const val RULES = "rules"
+    const val ADS = "ads"
     const val IVL = "ivl"
     const val DIM = "dim"
     const val KEEP = "keep"
@@ -107,6 +109,8 @@ object C {
     const val ZONE_ALL = 0
     const val ZONE_TOP = 1
     const val ZONE_BOTTOM = 2
+    const val ADS_SKIP = 0
+    const val ADS_WATCH = 1
     const val START = "ai.venice.autopilot.START"
     const val STOP = "ai.venice.autopilot.STOP"
 }
@@ -137,6 +141,11 @@ object Mem {
     }
     fun goal(c: Context, p: String) = P.sp(c).getString("goal_$p", "") ?: ""
     fun saveGoal(c: Context, p: String, g: String) { P.sp(c).edit().putString("goal_$p", g).apply() }
+    fun rules(c: Context, p: String) = P.sp(c).getString("rules_$p", "") ?: ""
+    fun saveRules(c: Context, p: String, r: String) {
+        if (r.isBlank()) P.sp(c).edit().remove("rules_$p").apply()
+        else P.sp(c).edit().putString("rules_$p", r).apply()
+    }
     fun clear(c: Context, p: String) { P.sp(c).edit().remove(nk(p)).apply() }
 }
 
@@ -377,7 +386,8 @@ class Brain(private val base: String, private val key: String, private val model
         val value: Int = -1,
         val done: Boolean = false,
         val reason: String = "",
-        val learn: List<String> = emptyList()
+        val learn: List<String> = emptyList(),
+        val rules: List<String> = emptyList()
     )
 
     fun ask(sys: String, userText: String, imgs: List<ByteArray>, onThink: (String) -> Unit, onAct: (A) -> Unit): S {
@@ -541,6 +551,7 @@ class Brain(private val base: String, private val key: String, private val model
             var think = ""
             var value = -1
             var learn = emptyList<String>()
+            var rules = emptyList<String>()
             if (a in 0 until b) {
                 try {
                     val j = JSONObject(raw.substring(a, b + 1))
@@ -553,9 +564,13 @@ class Brain(private val base: String, private val key: String, private val model
                     if (arr != null) {
                         learn = (0 until arr.length()).map { arr.optString(it) }
                     }
+                    val rr = j.optJSONArray("rules")
+                    if (rr != null) {
+                        rules = (0 until rr.length()).map { rr.optString(it) }
+                    }
                 } catch (e: Exception) {}
             }
-            return S(think, out, lvl, value, done, reason, learn)
+            return S(think, out, lvl, value, done, reason, learn, rules)
         }
 
         fun parse(json: String): A? = try {
@@ -749,6 +764,7 @@ class AutoPilotService : Service() {
 
     private var target = 0
     private var metric = ""
+    private var adsMode = C.ADS_SKIP
     private var hitCount = 0
     private var lastValue = -1
 
@@ -799,6 +815,7 @@ class AutoPilotService : Service() {
         maxSteps = if (intent != null) intent.getIntExtra("maxSteps", 0) else 0
         target = if (intent != null) intent.getIntExtra("target", 0) else 0
         metric = if (intent != null) intent.getStringExtra("metric").orEmpty() else ""
+        adsMode = if (intent != null) intent.getIntExtra("ads", C.ADS_SKIP) else C.ADS_SKIP
         val dim = if (intent != null) intent.getBooleanExtra("dim", true) else true
         val keep = if (intent != null) intent.getBooleanExtra("keepOn", true) else true
         val rawInterval = if (intent != null) intent.getIntExtra("interval", 900) else 900
@@ -1071,6 +1088,7 @@ class AutoPilotService : Service() {
                 while (hist.size > 5) hist.removeAt(0)
             }
             if (r.learn.isNotEmpty()) Mem.add(this, pkg, r.learn)
+            if (r.rules.isNotEmpty()) Mem.add(this, pkg, r.rules.map { "МЕХАНИКА: $it" })
             if (r.lvl) {
                 levels++
                 levelsLive = levels
@@ -1176,6 +1194,14 @@ class AutoPilotService : Service() {
     private fun system(): String {
         val sb = StringBuilder()
         sb.append("Ты — лучший игрок в мире и играешь в мобильную игру на Android, управляя только касаниями.\n")
+
+        val rules = Mem.rules(this, pkg)
+        if (rules.isNotBlank()) {
+            sb.append("\n=== ПРАВИЛА ИГРЫ — ГЛАВНЫЙ ЗАКОН, приоритет выше всех пунктов ниже ===\n")
+            sb.append(rules.trim()).append('\n')
+            sb.append("=== конец правил ===\n")
+        }
+
         sb.append("Кадр игры приходит картинкой ${imgW}x${viewH}. Игра: $pkg\n\n")
         sb.append("На картинке нарисована БИРЮЗОВАЯ СЕТКА с числами по краям — это пиксельные координаты. Сверяйся с ней.\n")
         sb.append("Красный крестик — куда ты нажимал в прошлый раз. Промахнулся — исправься.\n")
@@ -1192,8 +1218,8 @@ class AutoPilotService : Service() {
             sb.append("\n\nЧто ты знаешь об этой игре:\n")
             for (note in n) sb.append("  • ").append(note).append('\n')
         }
-        sb.append("\n\nОТВЕЧАЙ СТРОГО JSON, порядок ключей: think, actions, levelDone, value, done, reason, learn\n")
-        sb.append("{\"think\":\"что видишь и делаешь\",\"actions\":[{...}],\"levelDone\":false,\"value\":-1,\"done\":false,\"reason\":\"\",\"learn\":[]}\n\n")
+        sb.append("\n\nОТВЕЧАЙ СТРОГО JSON, порядок ключей: think, actions, levelDone, value, done, reason, learn, rules\n")
+        sb.append("{\"think\":\"что видишь и делаешь\",\"actions\":[{...}],\"levelDone\":false,\"value\":-1,\"done\":false,\"reason\":\"\",\"learn\":[],\"rules\":[]}\n\n")
         sb.append("Действия: tap {x,y} | double {x,y} | long {x,y,ms} | swipe {x,y,x2,y2,ms} | drag {x,y,x2,y2} | wait {ms} | back | restart\n\n")
         if (target > 0) {
             sb.append("=== ГЛАВНАЯ ЧИСЛОВАЯ ЦЕЛЬ ===\n")
@@ -1208,10 +1234,14 @@ class AutoPilotService : Service() {
         sb.append("3. Тап не изменил экран — промахнулся. Смотри на крестик и картинку 2 (зум), тапни точнее.\n")
         sb.append("4. Загрузка/анимация → wait 1200.\n")
         sb.append("5. Уровень пройден → levelDone true и тапни Next/Continue.\n")
-        sb.append("6. Реклама → закрой крестиком или «Пропустить». Реклама не конец уровня. Реклама за награду — смотри и забирай награду.\n")
+        if (adsMode == C.ADS_WATCH) {
+            sb.append("6. РЕКЛАМА (режим «смотреть за награду»): рекламу за награду досматривай до конца и забирай награду; обычную рекламу между уровнями закрывай сразу. Реклама — не конец уровня.\n")
+        } else {
+            sb.append("6. РЕКЛАМА (режим «пропускать»): закрывай ЛЮБУЮ рекламу максимально быстро — крестик, «Пропустить», «Закрыть», тап по экрану. Если крестика не видно 3–5 секунд, тапни ещё раз. Реклама — не конец уровня.\n")
+        }
         sb.append("7. Проигрыш → тапни Retry/Заново.\n")
         sb.append("8. Цель выполнена → done true и в reason что сделано.\n")
-        sb.append("9. Новую закономерность пиши в learn. Не дублируй.\n")
+        sb.append("9. Новую закономерность пиши в learn, а механику самой игры — в rules. Не дублируй то, что уже знаешь.\n")
         sb.append("10. Пустой actions не возвращай: не уверен — wait.\n")
         sb.append("11. Приоритеты как у профи: выживание, прогресс, бонусы. Прокачку не забывай — заходи в меню апгрейдов, когда есть ресурсы.\n")
         return sb.toString()
@@ -1378,6 +1408,7 @@ class MainActivity : Activity() {
     private lateinit var selLabel: TextView
     private lateinit var status: TextView
     private lateinit var goalField: EditText
+    private lateinit var rulesField: EditText
     private lateinit var api: EditText
     private lateinit var base: EditText
     private lateinit var model: EditText
@@ -1392,6 +1423,7 @@ class MainActivity : Activity() {
     private lateinit var keepBox: CheckBox
     private lateinit var modes: RadioGroup
     private lateinit var zones: RadioGroup
+    private lateinit var adsG: RadioGroup
     private lateinit var gamesPane: LinearLayout
     private lateinit var setPane: ScrollView
 
@@ -1443,10 +1475,17 @@ class MainActivity : Activity() {
         list.setPadding(0, 8, 0, 8)
         list.setOnItemClickListener { _, _, pos, _ ->
             val e = shown[pos]
+            val prev = sel
+            if (prev != null && prev != e.pkg) {
+                Mem.saveRules(this, prev, rulesField.text.toString())
+                Mem.saveGoal(this, prev, goalField.text.toString())
+            }
             sel = e.pkg
-            selLabel.text = "Выбрано: ${e.label}"
+            selLabel.text = pick(e)
             goalField.setText(Mem.goal(this, e.pkg))
+            rulesField.setText(Mem.rules(this, e.pkg))
             sp.edit().putString(P.LAST, e.pkg).apply()
+            save()
             val a = list.adapter
             if (a is Adapter) a.notifyDataSetChanged()
         }
@@ -1493,11 +1532,19 @@ class MainActivity : Activity() {
         model = EditText(this)
         model.hint = "vision-модель"
         goalField = EditText(this)
-        goalField.hint = "Цель словами: фарми золото, качай метры…"
+        goalField.hint = "Цель словами: фарм золото, качай метры…"
         setCol.addView(api)
         setCol.addView(base)
         setCol.addView(model)
         setCol.addView(goalField)
+
+        setCol.addView(txt("ПРАВИЛА ИГРЫ (для выбранной игры, сохраняется):", 12f, true))
+        rulesField = EditText(this)
+        rulesField.hint = "напр.: хорошее клади в ведро, опасное не трогай; рекламу пропускай; апгрейд метлы беру первым"
+        rulesField.gravity = Gravity.TOP or Gravity.START
+        rulesField.minLines = 3
+        rulesField.setSingleLine(false)
+        setCol.addView(rulesField)
 
         modes = RadioGroup(this)
         val mAi = RadioButton(this)
@@ -1518,6 +1565,18 @@ class MainActivity : Activity() {
         modes.addView(mHyb)
         modes.addView(mSpd)
         setCol.addView(modes)
+
+        adsG = RadioGroup(this)
+        val aSkip = RadioButton(this)
+        aSkip.text = "реклама: пропускать сразу"
+        aSkip.id = 21
+        aSkip.isChecked = true
+        val aWatch = RadioButton(this)
+        aWatch.text = "реклама: смотреть за награду"
+        aWatch.id = 22
+        adsG.addView(aSkip)
+        adsG.addView(aWatch)
+        setCol.addView(adsG)
 
         zones = RadioGroup(this)
         val zAll = RadioButton(this)
@@ -1620,11 +1679,23 @@ class MainActivity : Activity() {
         base.setText(sp.getString(P.BASE, P.DEF_BASE))
         model.setText(sp.getString(P.MODEL, P.DEF_MODEL))
         goalField.setText(sp.getString(P.GOAL, ""))
+        rulesField.setText(sp.getString(P.RULES, ""))
         ivl.setText(sp.getInt(P.IVL, 900).toString())
         targetField.setText(sp.getInt(P.TARGET, 0).toString())
         metricField.setText(sp.getString(P.METRIC, ""))
+        maxL.setText(sp.getInt("maxL", 0).toString())
+        maxM.setText(sp.getInt("maxM", 0).toString())
+        maxS.setText(sp.getInt("maxS", 0).toString())
         dimBox.isChecked = sp.getBoolean(P.DIM, true)
         keepBox.isChecked = sp.getBoolean(P.KEEP, true)
+        onlyGames.isChecked = sp.getBoolean("onlyGames", true)
+        adsG.check(if (sp.getInt(P.ADS, C.ADS_SKIP) == C.ADS_WATCH) 22 else 21)
+        when (sp.getInt(P.MODE, C.MODE_AI)) {
+            C.MODE_MACRO -> modes.check(2)
+            C.MODE_HYBRID -> modes.check(3)
+            C.MODE_SPEED -> modes.check(4)
+            else -> modes.check(1)
+        }
         when (sp.getInt(P.ZONE, C.ZONE_ALL)) {
             C.ZONE_TOP -> zones.check(12)
             C.ZONE_BOTTOM -> zones.check(13)
@@ -1656,7 +1727,9 @@ class MainActivity : Activity() {
                 toast("Выбери игру")
             } else {
                 Mem.clear(this, p)
+                Mem.saveRules(this, p, "")
                 goalField.setText("")
+                rulesField.setText("")
                 toast("Память сброшена")
             }
         }
@@ -1681,6 +1754,11 @@ class MainActivity : Activity() {
         load()
     }
 
+    private fun pick(e: AppEntry): String {
+        val r = if (Mem.rules(this, e.pkg).isNotBlank()) " • правила есть" else ""
+        return "Выбрано: ${e.label}$r"
+    }
+
     private fun txt(t: String, sz: Float, bold: Boolean): TextView {
         val v = TextView(this)
         v.text = t
@@ -1703,6 +1781,8 @@ class MainActivity : Activity() {
         13 -> C.ZONE_BOTTOM
         else -> C.ZONE_ALL
     }
+
+    private fun currentAds(): Int = if (adsG.checkedRadioButtonId == 22) C.ADS_WATCH else C.ADS_SKIP
 
     private fun applyFilter() {
         val q = search.text.toString().trim().lowercase()
@@ -1739,8 +1819,9 @@ class MainActivity : Activity() {
                     val f = found.firstOrNull { it.pkg == last }
                     if (f != null) {
                         sel = f.pkg
-                        selLabel.text = "Выбрано: ${f.label}"
+                        selLabel.text = pick(f)
                         goalField.setText(Mem.goal(this, f.pkg))
+                        rulesField.setText(Mem.rules(this, f.pkg))
                     }
                 }
             }
@@ -1771,6 +1852,8 @@ class MainActivity : Activity() {
             return
         }
         save()
+        Mem.saveGoal(this, p, goalField.text.toString())
+        Mem.saveRules(this, p, rulesField.text.toString())
         pend = m
         val mpm = getSystemService(MediaProjectionManager::class.java)
         startActivityForResult(mpm.createScreenCaptureIntent(), 1001)
@@ -1781,7 +1864,11 @@ class MainActivity : Activity() {
         if (req == 1001 && res == RESULT_OK && data != null) {
             val g = goalField.text.toString()
             val p = sel
-            if (p != null) Mem.saveGoal(this, p, g)
+            if (p != null) {
+                Mem.saveGoal(this, p, g)
+                Mem.saveRules(this, p, rulesField.text.toString())
+            }
+            save()
             val i = Intent(this, AutoPilotService::class.java)
             i.action = C.START
             i.putExtra("code", res)
@@ -1795,6 +1882,7 @@ class MainActivity : Activity() {
             i.putExtra("maxSteps", maxS.text.toString().toIntOrNull() ?: 0)
             i.putExtra("target", targetField.text.toString().toIntOrNull() ?: 0)
             i.putExtra("metric", metricField.text.toString().trim())
+            i.putExtra("ads", currentAds())
             i.putExtra("dim", dimBox.isChecked)
             i.putExtra("keepOn", keepBox.isChecked)
             i.putExtra("zone", currentZone())
@@ -1805,15 +1893,34 @@ class MainActivity : Activity() {
         }
     }
 
+    override fun onPause() {
+        super.onPause()
+        try { save() } catch (e: Throwable) {}
+        val p = sel
+        if (p != null) {
+            try {
+                Mem.saveGoal(this, p, goalField.text.toString())
+                Mem.saveRules(this, p, rulesField.text.toString())
+            } catch (e: Throwable) {}
+        }
+    }
+
     private fun save() {
         sp.edit()
             .putString(P.API, api.text.toString().trim())
             .putString(P.BASE, base.text.toString().trim())
             .putString(P.MODEL, model.text.toString().trim())
             .putString(P.GOAL, goalField.text.toString())
+            .putString(P.RULES, rulesField.text.toString())
             .putInt(P.IVL, ivl.text.toString().toIntOrNull() ?: 900)
+            .putInt("maxL", maxL.text.toString().toIntOrNull() ?: 0)
+            .putInt("maxM", maxM.text.toString().toIntOrNull() ?: 0)
+            .putInt("maxS", maxS.text.toString().toIntOrNull() ?: 0)
             .putBoolean(P.DIM, dimBox.isChecked)
             .putBoolean(P.KEEP, keepBox.isChecked)
+            .putBoolean("onlyGames", onlyGames.isChecked)
+            .putInt(P.MODE, currentMode())
+            .putInt(P.ADS, currentAds())
             .putInt(P.ZONE, currentZone())
             .putInt(P.TARGET, targetField.text.toString().toIntOrNull() ?: 0)
             .putString(P.METRIC, metricField.text.toString().trim())
