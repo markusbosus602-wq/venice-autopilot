@@ -86,6 +86,7 @@ object P {
     const val BASE = "base"
     const val MODEL = "model"
     const val MODE = "mode"
+    const val AUTO = "auto"
     const val GOAL = "goal"
     const val RULES = "rules"
     const val ADS = "ads"
@@ -114,6 +115,11 @@ object C {
     const val ADS_WATCH = 1
     const val START = "ai.venice.autopilot.START"
     const val STOP = "ai.venice.autopilot.STOP"
+    const val RULES_TEMPLATE =
+        "Собираю только полезное, опасное не трогаю.\n" +
+        "Апгрейды покупаю, как только хватает ресурсов.\n" +
+        "Рекламу пропускаю сразу.\n" +
+        "Играю уровень до победы, аптечки и бонусы забираю."
 }
 
 object Mem {
@@ -235,7 +241,7 @@ fun Bitmap.toJpg(q: Int = 70): ByteArray {
     return os.toByteArray()
 }
 
-// ==================== Тапы ====================
+// ==================== Тапы и жесты ====================
 
 class TouchService : AccessibilityService() {
 
@@ -281,8 +287,38 @@ class TouchService : AccessibilityService() {
         send(stroke(Path().apply { moveTo(x, y) }, ms))
     }
 
+    fun hold(x: Float, y: Float, ms: Long) = tap(x, y, ms)
+
     fun swipe(x1: Float, y1: Float, x2: Float, y2: Float, ms: Long = 250L) {
         send(stroke(Path().apply { moveTo(x1, y1); lineTo(x2, y2) }, ms))
+    }
+
+    fun dragTo(x1: Float, y1: Float, x2: Float, y2: Float, ms: Long) {
+        val p = Path().apply { moveTo(x1, y1); lineTo(x2, y2) }
+        send(stroke(p, ms, 120L))
+    }
+
+    fun drag(x1: Float, y1: Float, x2: Float, y2: Float) = dragTo(x1, y1, x2, y2, 700L)
+
+    fun pathMove(pts: List<Pair<Float, Float>>, ms: Long) {
+        if (pts.size < 2) return
+        val p = Path()
+        p.moveTo(pts[0].first, pts[0].second)
+        for (i in 1 until pts.size) p.lineTo(pts[i].first, pts[i].second)
+        send(stroke(p, ms, 100L))
+    }
+
+    fun wiggle(x1: Float, y1: Float, x2: Float, y2: Float, times: Int, perPass: Long) {
+        val p = Path()
+        p.moveTo(x1, y1)
+        var i = 0
+        while (i < times) {
+            p.lineTo(x2, y2)
+            p.lineTo(x1, y1)
+            i++
+        }
+        val total = (perPass * 2L * times).coerceIn(150L, 5000L)
+        send(stroke(p, total, 80L))
     }
 
     fun doubleTap(x: Float, y: Float) {
@@ -294,11 +330,6 @@ class TouchService : AccessibilityService() {
                 .addStroke(GestureDescription.StrokeDescription(p2, 90L, 35L))
                 .build()
         )
-    }
-
-    fun drag(x1: Float, y1: Float, x2: Float, y2: Float) {
-        val p = Path().apply { moveTo(x1, y1); lineTo(x2, y2) }
-        send(stroke(p, 700L, 200L))
     }
 
     private fun stroke(p: Path, ms: Long, d: Long = 0L): GestureDescription =
@@ -378,7 +409,17 @@ class Capture(
 
 class Brain(private val base: String, private val key: String, private val model: String) {
 
-    data class A(val t: String, val x: Int = 0, val y: Int = 0, val x2: Int = 0, val y2: Int = 0, val ms: Int = 0)
+    data class A(
+        val t: String,
+        val x: Int = 0,
+        val y: Int = 0,
+        val x2: Int = 0,
+        val y2: Int = 0,
+        val ms: Int = 0,
+        val x3: Int = 0,
+        val y3: Int = 0,
+        val n: Int = 0
+    )
 
     data class S(
         val think: String = "",
@@ -388,7 +429,8 @@ class Brain(private val base: String, private val key: String, private val model
         val done: Boolean = false,
         val reason: String = "",
         val learn: List<String> = emptyList(),
-        val rules: List<String> = emptyList()
+        val rules: List<String> = emptyList(),
+        val playing: Boolean = false
     )
 
     fun ask(sys: String, userText: String, imgs: List<ByteArray>, onThink: (String) -> Unit, onAct: (A) -> Unit): S {
@@ -553,6 +595,7 @@ class Brain(private val base: String, private val key: String, private val model
             var value = -1
             var learn = emptyList<String>()
             var rules = emptyList<String>()
+            var playing = false
             if (a in 0 until b) {
                 try {
                     val j = JSONObject(raw.substring(a, b + 1))
@@ -561,6 +604,7 @@ class Brain(private val base: String, private val key: String, private val model
                     done = j.optBoolean("done", false)
                     reason = j.optString("reason", "")
                     value = j.optInt("value", -1)
+                    playing = j.optBoolean("playing", false)
                     val arr = j.optJSONArray("learn")
                     if (arr != null) {
                         learn = (0 until arr.length()).map { arr.optString(it) }
@@ -571,7 +615,7 @@ class Brain(private val base: String, private val key: String, private val model
                     }
                 } catch (e: Exception) {}
             }
-            return S(think, out, lvl, value, done, reason, learn, rules)
+            return S(think, out, lvl, value, done, reason, learn, rules, playing)
         }
 
         fun parse(json: String): A? = try {
@@ -579,7 +623,10 @@ class Brain(private val base: String, private val key: String, private val model
             A(
                 o.optString("type", "tap").lowercase(),
                 o.optInt("x"), o.optInt("y"),
-                o.optInt("x2"), o.optInt("y2"), o.optInt("ms")
+                o.optInt("x2"), o.optInt("y2"),
+                o.optInt("ms"),
+                o.optInt("x3"), o.optInt("y3"),
+                o.optInt("n")
             )
         } catch (e: Exception) {
             null
@@ -759,6 +806,7 @@ class AutoPilotService : Service() {
     private var pkg = ""
     private var mode = C.MODE_AI
     private var goal = ""
+    private var autostart = true
     private var maxLevels = 0
     private var maxMinutes = 0
     private var maxSteps = 0
@@ -811,6 +859,7 @@ class AutoPilotService : Service() {
         pkg = if (intent != null) intent.getStringExtra("pkg").orEmpty() else ""
         mode = if (intent != null) intent.getIntExtra("mode", C.MODE_AI) else C.MODE_AI
         goal = if (intent != null) intent.getStringExtra("goal").orEmpty() else ""
+        autostart = if (intent != null) intent.getBooleanExtra("auto", true) else true
         maxLevels = if (intent != null) intent.getIntExtra("maxLevels", 0) else 0
         maxMinutes = if (intent != null) intent.getIntExtra("maxMinutes", 0) else 0
         maxSteps = if (intent != null) intent.getIntExtra("maxSteps", 0) else 0
@@ -920,32 +969,50 @@ class AutoPilotService : Service() {
             while (paused && running.get()) delay(80)
             if (!running.get()) return
             val t = TouchService.inst
+            val ax = a.x * sx
+            val ay = (a.y + zoneY0) * sy
+            val bx = a.x2 * sx
+            val by = (a.y2 + zoneY0) * sy
             when (a.t) {
                 "tap" -> {
-                    if (t != null) t.tap(a.x * sx, (a.y + zoneY0) * sy)
+                    if (t != null) t.tap(ax, ay)
                     note(a.x, a.y)
                 }
                 "double" -> {
-                    if (t != null) t.doubleTap(a.x * sx, (a.y + zoneY0) * sy)
+                    if (t != null) t.doubleTap(ax, ay)
                     note(a.x, a.y)
                 }
-                "long" -> {
-                    if (t != null) t.tap(a.x * sx, (a.y + zoneY0) * sy, a.ms.toLong().coerceIn(200L, 4000L))
+                "hold", "long" -> {
+                    if (t != null) t.hold(ax, ay, a.ms.toLong().coerceIn(150L, 5000L))
                     note(a.x, a.y)
                 }
                 "swipe" -> {
-                    if (t != null) {
-                        t.swipe(
-                            a.x * sx, (a.y + zoneY0) * sy,
-                            a.x2 * sx, (a.y2 + zoneY0) * sy,
-                            a.ms.toLong().coerceIn(80L, 2000L)
-                        )
-                    }
+                    if (t != null) t.swipe(ax, ay, bx, by, a.ms.toLong().coerceIn(60L, 1500L))
                     note(a.x, a.y)
                 }
                 "drag" -> {
+                    if (t != null) t.dragTo(ax, ay, bx, by, a.ms.toLong().coerceIn(150L, 4000L))
+                    note(a.x, a.y)
+                }
+                "path" -> {
                     if (t != null) {
-                        t.drag(a.x * sx, (a.y + zoneY0) * sy, a.x2 * sx, (a.y2 + zoneY0) * sy)
+                        val pts = ArrayList<Pair<Float, Float>>(3)
+                        pts.add(ax to ay)
+                        pts.add(bx to by)
+                        if (a.x3 != 0 || a.y3 != 0) {
+                            pts.add(a.x3 * sx to (a.y3 + zoneY0) * sy)
+                        }
+                        t.pathMove(pts, a.ms.toLong().coerceIn(200L, 4000L))
+                    }
+                    note(a.x, a.y)
+                }
+                "wiggle" -> {
+                    if (t != null) {
+                        t.wiggle(
+                            ax, ay, bx, by,
+                            a.n.coerceIn(1, 6),
+                            a.ms.toLong().coerceIn(120L, 1200L)
+                        )
                     }
                     note(a.x, a.y)
                 }
@@ -969,6 +1036,14 @@ class AutoPilotService : Service() {
         if (lvlTaps.size < 200) lvlTaps.add(Mac.T(x, y, d.coerceIn(40, 4000), false))
     }
 
+    private fun tapImg(x: Int, y: Int) {
+        val t = TouchService.inst ?: return
+        val sx = scrW.toFloat() / imgW
+        val sy = scrH.toFloat() / imgH
+        t.tap(x * sx, y * sy)
+        lastTap = x to y
+    }
+
     private fun zone(f: Bitmap): Bitmap {
         if (viewH >= f.height) return f
         return try {
@@ -978,10 +1053,95 @@ class AutoPilotService : Service() {
         }
     }
 
+    // ---------- этап входа: сам нахожу старт ----------
+
+    private suspend fun entryLoop(brain: Brain, cadence: Long) {
+        set("сам ищу кнопку старта…")
+        var n = 0
+        var idleSteps = 0
+        while (scope.isActive && running.get() && n < 16) {
+            if (paused) { delay(150); continue }
+            if (!gameVisible()) { delay(300); continue }
+            n++
+            val full = cap?.frame()
+            if (full == null) {
+                if (SystemClock.elapsedRealtime() - lastFrameAt > 7000) cap?.recreate()
+                delay(250)
+                continue
+            }
+            lastFrameAt = SystemClock.elapsedRealtime()
+            val f = zone(full)
+            val cur = signature(f)
+            if (cur == 0L) black++ else black = 0
+            if (black > 45) {
+                black = 0
+                launchGame()
+                delay(3000)
+                continue
+            }
+
+            val drawn = Gr.draw(f)
+            val acts = ArrayList<Brain.A>()
+            var res: Brain.S? = null
+            try {
+                res = brain.ask(
+                    entrySystem(),
+                    "Вход в игру, попытка $n. Что нажать, чтобы начать играть?",
+                    listOf(drawn.toJpg(70)),
+                    { th -> set(th.take(70)) },
+                    { a ->
+                        acts.add(a)
+                        pending.incrementAndGet()
+                        queue.trySend(a)
+                    }
+                )
+            } catch (e: Exception) {
+                val em = e.message ?: ""
+                if (em.contains("429")) {
+                    set("лимит запросов — пауза 10с")
+                    delay(10000)
+                } else {
+                    set("ошибка ИИ на входе")
+                }
+                delay(1200)
+                continue
+            }
+
+            val dl = SystemClock.elapsedRealtime() + 10000
+            while (pending.get() > 0 && SystemClock.elapsedRealtime() < dl) delay(40)
+
+            if (res != null && res.playing) {
+                set("игра началась")
+                delay(400)
+                return
+            }
+
+            if (acts.isEmpty()) {
+                idleSteps++
+                if (idleSteps >= 2) {
+                    tapImg(imgW / 2, zoneY0 + (viewH * 0.72).toInt())
+                    idleSteps = 0
+                    set("сам жму центр")
+                }
+            } else {
+                idleSteps = 0
+            }
+
+            delay(cadence.coerceAtLeast(700L))
+        }
+        set("старт не найден — играю как есть")
+        delay(300)
+    }
+
     private suspend fun thinkLoop(brain: Brain, cadence: Long) {
         var lastSig = 0L
         var idle = 0
         var noOp = 0
+
+        if (autostart && (mode == C.MODE_AI || mode == C.MODE_HYBRID)) {
+            entryLoop(brain, cadence)
+        }
+        lastSig = 0L
 
         while (scope.isActive && running.get()) {
             if (paused) {
@@ -1111,18 +1271,25 @@ class AutoPilotService : Service() {
                 }
             }
 
-            val dl = SystemClock.elapsedRealtime() + 12000
+            val dl = SystemClock.elapsedRealtime() + 14000
             while (pending.get() > 0 && SystemClock.elapsedRealtime() < dl) delay(40)
             delay(220)
 
             val after = cap?.frame()?.let { signature(zone(it)) } ?: 0L
             var hadTap = false
             for (a in r.acts) {
-                if (a.t == "tap" || a.t == "double" || a.t == "long" || a.t == "swipe" || a.t == "drag") {
+                if (a.t == "tap" || a.t == "double" || a.t == "long" || a.t == "hold" ||
+                    a.t == "swipe" || a.t == "drag" || a.t == "path" || a.t == "wiggle"
+                ) {
                     hadTap = true
                 }
             }
             noOp = if (hadTap && ham(before, after) <= 3) (noOp + 1).coerceAtMost(6) else 0
+
+            if (noOp == 2) {
+                tapImg(imgW / 2, zoneY0 + (viewH * 0.78).toInt())
+                set("сам жму главную кнопку")
+            }
             if (noOp >= 4) {
                 set("застрял — перезапуск")
                 launchGame()
@@ -1192,6 +1359,61 @@ class AutoPilotService : Service() {
         }
     }
 
+    // ---------- промпты ----------
+
+    private fun universal(): String {
+        val sb = StringBuilder()
+        sb.append("\n=== КАК ЧИТАТЬ ЭКРАН (работает всегда, правила игры это дополняют) ===\n")
+        sb.append("• Всплывающее окно: фон затемнён, в центре панель. Закрывается крестиком в правом верхнем углу, кнопкой «Закрыть/Продолжить/ОК/Забрать» или тапом вне окна.\n")
+        sb.append("• Главная кнопка запуска: крупная яркая кнопка в центре или снизу (зелёная, жёлтая, синяя), часто со словом Play/Играть/Старт/Начать/Продолжить/Уровень. Начинай с неё.\n")
+        sb.append("• Экран со звёздами, «Level Complete», наградой → жми Next/Продолжить/стрелку вправо/зелёную кнопку.\n")
+        sb.append("• Экран проигрыша → жми Retry/Заново/Продолжить.\n")
+        sb.append("• Обучение и подсказки: жми туда, куда показывает рука или стрелка. Нарисованный палец — указание куда нажать или куда вести.\n")
+        sb.append("• Ежедневная награда, подарок, сундук, колесо → забери (Claim/Забрать/Открыть/Крутить), это бесплатно.\n")
+        sb.append("• Магазин и апгрейды: хватает ресурсов — покупай то, что помогает цели. Не хватает — выходи.\n")
+        sb.append("• Совсем не понял экран → тап по центру, wait 900, посмотри, что изменилось.\n")
+        sb.append("• Ты работаешь САМ. Не жди человека, не останавливайся, всегда что-то делай.\n")
+        return sb.toString()
+    }
+
+    private fun control(): String {
+        val sb = StringBuilder()
+        sb.append("\n=== КАК УПРАВЛЯТЬ: ТАПЫ, ЗАЖИМ, ВОЖДЕНИЕ (очень важно) ===\n")
+        sb.append("• Объект надо ВЕЗТИ/ВОДИТЬ/КАТАТЬ (ведро, корзина, тачка, платформа, персонаж, палец): хватай объект и веди — drag {x,y,x2,y2,ms}. Палец ставится в x,y и едет до x2,y2 за ms мс. Медленно = ms 1200, быстро = ms 250.\n")
+        sb.append("• Водить ТУДА-СЮДА между двумя точками: wiggle {x,y,x2,y2,n,ms} — n раз туда-обратно одним жестом. Это для «дёргай ведро туда-сюда».\n")
+        sb.append("• Вести по сложному пути в обход: path {x,y,x2,y2,x3,y3,ms} — палец идёт по трём точкам (можно объехать опасное).\n")
+        sb.append("• Зажать и держать, не отпуская (зарядка, удержание кнопки, поднять объект): hold {x,y,ms}.\n")
+        sb.append("• Джойстик: hold на джойстике и веди drag в нужную сторону. Меняй направление, не отпуская.\n")
+        sb.append("• Резкий бросок/удар: swipe {x,y,x2,y2,ms} с маленьким ms (150).\n")
+        sb.append("• Ведро/корзина с падающими предметами: держи палец НА ведре и веди его ПОД хороший предмет (drag или path). Опасное — пропускай или уводи ведро в сторону.\n")
+        sb.append("• Персонаж-раннер: держи палец и води влево-вправо, чтобы уклоняться (wiggle или серия drag).\n")
+        sb.append("• Если объект должен ДВИГАТЬСЯ — не тапай по нему несколько раз, а ВЕДИ его. Повторный тап по тому же месту ничего не меняет.\n")
+        sb.append("• Определи тип управления игры и запиши это в rules один раз, например: «управление: вести ведро влево-вправо».\n")
+        return sb.toString()
+    }
+
+    private fun entrySystem(): String {
+        val sb = StringBuilder()
+        sb.append("Ты — умный бот, который ведёт мобильную игру на Android касаниями.\n")
+        sb.append("Сейчас этап ВХОДА В ИГРУ: экран меню, заставка, попап, обучение или загрузка.\n")
+        sb.append("Кадр приходит картинкой ${imgW}x${viewH}, на ней бирюзовая сетка с координатами. Игра: $pkg\n")
+        sb.append("Красный крестик — куда жал в прошлый раз.\n")
+        val rules = Mem.rules(this, pkg)
+        if (rules.isNotBlank()) {
+            sb.append("\n=== ПРАВИЛА ИГРЫ (главный закон) ===\n").append(rules.trim()).append('\n')
+        }
+        sb.append(universal())
+        sb.append(control())
+        sb.append("\nЗАДАЧА ЭТАПА: добраться до игрового процесса.\n")
+        sb.append("Найди и нажми кнопку запуска игры или уровня (Play, Играть, Старт, Начать, Продолжить, номер уровня). Закрой попапы и туториал. Если в обучении надо вести объект — веди его (drag).\n")
+        sb.append("Если игра уже идёт (видно поле, персонажа, счёт) — поставь \"playing\": true и ничего не жми.\n")
+        sb.append("Если идёт загрузка (крутится колёсико, полоса прогресса) — wait 1200 и \"playing\": false.\n")
+        sb.append("\nОТВЕТ СТРОГО JSON: {\"think\":\"что вижу и что жму\",\"actions\":[{...}],\"playing\":false}\n")
+        sb.append("Действия: tap {x,y} | hold {x,y,ms} | drag {x,y,x2,y2,ms} | path {x,y,x2,y2,x3,y3,ms} | wiggle {x,y,x2,y2,n,ms} | swipe {x,y,x2,y2,ms} | wait {ms} | back\n")
+        sb.append("Максимум 2 действия. Пустой actions не возвращай: не уверен — wait 800.\n")
+        return sb.toString()
+    }
+
     private fun system(): String {
         val sb = StringBuilder()
         sb.append("Ты — лучший игрок в мире и играешь в мобильную игру на Android, управляя только касаниями.\n")
@@ -1203,7 +1425,7 @@ class AutoPilotService : Service() {
             sb.append("=== конец правил ===\n")
         }
 
-        sb.append("Кадр игры приходит картинкой ${imgW}x${viewH}. Игра: $pkg\n\n")
+        sb.append("Кадр игры приходит картинкой ${imgW}x${viewH}. Игра: $pkg\n")
         sb.append("На картинке нарисована БИРЮЗОВАЯ СЕТКА с числами по краям — это пиксельные координаты. Сверяйся с ней.\n")
         sb.append("Красный крестик — куда ты нажимал в прошлый раз. Промахнулся — исправься.\n")
         sb.append("Панель с надписью AutoPilot сверху слева — интерфейс бота, не игра.\n")
@@ -1219,32 +1441,37 @@ class AutoPilotService : Service() {
             sb.append("\n\nЧто ты знаешь об этой игре:\n")
             for (note in n) sb.append("  • ").append(note).append('\n')
         }
-        sb.append("\n\nОТВЕЧАЙ СТРОГО JSON, порядок ключей: think, actions, levelDone, value, done, reason, learn, rules\n")
+
+        sb.append(universal())
+        sb.append(control())
+
+        sb.append("\nОТВЕЧАЙ СТРОГО JSON, порядок ключей: think, actions, levelDone, value, done, reason, learn, rules\n")
         sb.append("{\"think\":\"что видишь и делаешь\",\"actions\":[{...}],\"levelDone\":false,\"value\":-1,\"done\":false,\"reason\":\"\",\"learn\":[],\"rules\":[]}\n\n")
-        sb.append("Действия: tap {x,y} | double {x,y} | long {x,y,ms} | swipe {x,y,x2,y2,ms} | drag {x,y,x2,y2} | wait {ms} | back | restart\n\n")
+        sb.append("Действия: tap {x,y} | double {x,y} | hold {x,y,ms} | swipe {x,y,x2,y2,ms} | drag {x,y,x2,y2,ms} | path {x,y,x2,y2,x3,y3,ms} | wiggle {x,y,x2,y2,n,ms} | wait {ms} | back | restart\n\n")
         if (target > 0) {
             sb.append("=== ГЛАВНАЯ ЧИСЛОВАЯ ЦЕЛЬ ===\n")
             sb.append("Показатель, за которым надо следить: «$metric». Целевое значение: $target.\n")
             sb.append("В КАЖДОМ ответе заполняй поле \"value\" — текущее значение этого показателя, ТОЛЬКО ЦИФРЫ, без букв, пробелов и знаков (например 1240). Если показатель на экране не виден — \"value\": -1.\n")
-            sb.append("Играй так, чтобы этот показатель рос: зарабатывай ресурсы и трать их на прокачку именно этого показателя. Если показатель уменьшился (потратил) — не паникуй, это нормально, но следи, чтобы он в итоге рос.\n")
+            sb.append("Играй так, чтобы этот показатель рос: зарабатывай ресурсы и трать их на прокачку именно этого показателя. Если показатель уменьшился (потратил) — это нормально, следи, чтобы он в итоге рос.\n")
             sb.append("Когда показатель станет $target или больше — поставь \"done\": true и в \"reason\" напиши достигнутое значение.\n\n")
         }
-        sb.append("ПРАВИЛА:\n")
+        sb.append("ПРАВИЛА РАБОТЫ:\n")
         sb.append("1. Координаты в пикселях картинки 1, (0,0) слева сверху. Сверяйся с сеткой.\n")
         sb.append("2. Обычно 1–3 действия, до 6 только для связки. Действия выполняются сразу по мере выхода JSON.\n")
-        sb.append("3. Тап не изменил экран — промахнулся. Смотри на крестик и картинку 2 (зум), тапни точнее.\n")
+        sb.append("3. Тап не изменил экран — не повторяй тот же тап. Попробуй рядом, либо drag/hold, если объект надо вести или держать.\n")
         sb.append("4. Загрузка/анимация → wait 1200.\n")
         sb.append("5. Уровень пройден → levelDone true и тапни Next/Continue.\n")
         if (adsMode == C.ADS_WATCH) {
-            sb.append("6. РЕКЛАМА (режим «смотреть за награду»): рекламу за награду досматривай до конца и забирай награду; обычную рекламу между уровнями закрывай сразу. Реклама — не конец уровня.\n")
+            sb.append("6. РЕКЛАМА (режим «смотреть за награду»): рекламу за награду досматривай и забирай награду; обычную рекламу между уровнями закрывай сразу. Реклама — не конец уровня.\n")
         } else {
-            sb.append("6. РЕКЛАМА (режим «пропускать»): закрывай ЛЮБУЮ рекламу максимально быстро — крестик, «Пропустить», «Закрыть», тап по экрану. Если крестика не видно 3–5 секунд, тапни ещё раз. Реклама — не конец уровня.\n")
+            sb.append("6. РЕКЛАМА (режим «пропускать»): закрывай ЛЮБУЮ рекламу максимально быстро — крестик, «Пропустить», «Закрыть», тап по экрану. Если крестика нет 3–5 секунд, тапни ещё раз. Реклама — не конец уровня.\n")
         }
         sb.append("7. Проигрыш → тапни Retry/Заново.\n")
         sb.append("8. Цель выполнена → done true и в reason что сделано.\n")
-        sb.append("9. Новую закономерность пиши в learn, а механику самой игры — в rules. Не дублируй то, что уже знаешь.\n")
+        sb.append("9. Новую закономерность пиши в learn, а механику и тип управления — в rules. Не дублируй то, что уже знаешь.\n")
         sb.append("10. Пустой actions не возвращай: не уверен — wait.\n")
-        sb.append("11. Приоритеты как у профи: выживание, прогресс, бонусы. Прокачку не забывай — заходи в меню апгрейдов, когда есть ресурсы.\n")
+        sb.append("11. Если экран снова стал меню, магазином или выскочил попап — сначала разберись с ним, потом возвращайся к игре.\n")
+        sb.append("12. Приоритеты как у профи: выживание, прогресс, бонусы. Прокачку не забывай — заходи в меню апгрейдов, когда есть ресурсы.\n")
         return sb.toString()
     }
 
@@ -1253,7 +1480,11 @@ class AutoPilotService : Service() {
         if (goal.isNotBlank()) sb.append("ЦЕЛЬ: $goal\n")
         sb.append("Шаг $steps, уровней пройдено: $levels\n")
         if (target > 0) sb.append("Текущий $metric: $lastValue (цель $target)\n")
-        if (noOp > 0) sb.append("ВНИМАНИЕ: последние $noOp тапов не изменили экран.\n")
+        if (noOp > 0) {
+            sb.append("ВНИМАНИЕ: последние $noOp действий не изменили экран.\n")
+            if (noOp == 1) sb.append("Ты попал мимо или действие не сработало. Если объект надо вести — используй drag, а не тап.\n")
+            if (noOp >= 2) sb.append("Экран застыл: похоже, это меню или попап. Ищи кнопку запуска или закрытия, смотри блок «КАК ЧИТАТЬ ЭКРАН».\n")
+        }
         if (hist.isNotEmpty()) {
             sb.append("Прошлые шаги:\n")
             for (h in hist) sb.append("  ").append(h).append('\n')
@@ -1422,6 +1653,7 @@ class MainActivity : Activity() {
     private lateinit var onlyGames: CheckBox
     private lateinit var dimBox: CheckBox
     private lateinit var keepBox: CheckBox
+    private lateinit var autoBox: CheckBox
     private lateinit var modes: RadioGroup
     private lateinit var zones: RadioGroup
     private lateinit var adsG: RadioGroup
@@ -1532,20 +1764,31 @@ class MainActivity : Activity() {
         base.hint = "Base URL"
         model = EditText(this)
         model.hint = "vision-модель"
-        goalField = EditText(this)
-        goalField.hint = "Цель словами: фарм золото, качай метры…"
         setCol.addView(api)
         setCol.addView(base)
         setCol.addView(model)
+
+        setCol.addView(txt("ЦЕЛЬ (словами, для выбранной игры):", 12f, true))
+        goalField = EditText(this)
+        goalField.hint = "напр.: прокачать метлу до 2000 метров, собрать 50k золота"
         setCol.addView(goalField)
 
         setCol.addView(txt("ПРАВИЛА ИГРЫ (для выбранной игры, сохраняется):", 12f, true))
         rulesField = EditText(this)
-        rulesField.hint = "напр.: хорошее клади в ведро, опасное не трогай; рекламу пропускай; апгрейд метлы беру первым"
+        rulesField.hint = "напр.: камни не собирать, хорошее кладу в ведро, опасное не трогаю"
         rulesField.gravity = Gravity.TOP or Gravity.START
         rulesField.minLines = 3
         rulesField.setSingleLine(false)
         setCol.addView(rulesField)
+
+        val bTpl = Button(this)
+        bTpl.text = "Пример правил"
+        setCol.addView(bTpl)
+
+        autoBox = CheckBox(this)
+        autoBox.text = "сам прохожу меню, старт и туториал"
+        autoBox.isChecked = true
+        setCol.addView(autoBox)
 
         modes = RadioGroup(this)
         val mAi = RadioButton(this)
@@ -1689,6 +1932,7 @@ class MainActivity : Activity() {
         maxS.setText(sp.getInt("maxS", 0).toString())
         dimBox.isChecked = sp.getBoolean(P.DIM, true)
         keepBox.isChecked = sp.getBoolean(P.KEEP, true)
+        autoBox.isChecked = sp.getBoolean(P.AUTO, true)
         onlyGames.isChecked = sp.getBoolean("onlyGames", true)
         adsG.check(if (sp.getInt(P.ADS, C.ADS_SKIP) == C.ADS_WATCH) 22 else 21)
         when (sp.getInt(P.MODE, C.MODE_AI)) {
@@ -1715,6 +1959,10 @@ class MainActivity : Activity() {
             } else {
                 toast("Уже разрешено")
             }
+        }
+        bTpl.setOnClickListener {
+            rulesField.setText(C.RULES_TEMPLATE)
+            toast("Пример подставлен — правь под игру")
         }
         bTest.setOnClickListener { test() }
         bRec.setOnClickListener { flow(C.MODE_RECORD) }
@@ -1878,6 +2126,7 @@ class MainActivity : Activity() {
             i.putExtra("mode", pend)
             i.putExtra("interval", ivl.text.toString().toIntOrNull() ?: 900)
             i.putExtra("goal", g)
+            i.putExtra("auto", autoBox.isChecked)
             i.putExtra("maxLevels", maxL.text.toString().toIntOrNull() ?: 0)
             i.putExtra("maxMinutes", maxM.text.toString().toIntOrNull() ?: 0)
             i.putExtra("maxSteps", maxS.text.toString().toIntOrNull() ?: 0)
@@ -1919,6 +2168,7 @@ class MainActivity : Activity() {
             .putInt("maxS", maxS.text.toString().toIntOrNull() ?: 0)
             .putBoolean(P.DIM, dimBox.isChecked)
             .putBoolean(P.KEEP, keepBox.isChecked)
+            .putBoolean(P.AUTO, autoBox.isChecked)
             .putBoolean("onlyGames", onlyGames.isChecked)
             .putInt(P.MODE, currentMode())
             .putInt(P.ADS, currentAds())
