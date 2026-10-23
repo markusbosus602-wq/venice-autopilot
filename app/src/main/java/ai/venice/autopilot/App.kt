@@ -77,6 +77,7 @@ import java.net.HttpURLConnection
 import java.net.URL
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
+import kotlin.math.roundToInt
 
 // ==================== Настройки (всё хранится на диске) ====================
 
@@ -411,13 +412,13 @@ class Brain(private val base: String, private val key: String, private val model
 
     data class A(
         val t: String,
-        val x: Int = 0,
-        val y: Int = 0,
-        val x2: Int = 0,
-        val y2: Int = 0,
+        val x: Float = 0f,
+        val y: Float = 0f,
+        val x2: Float = 0f,
+        val y2: Float = 0f,
         val ms: Int = 0,
-        val x3: Int = 0,
-        val y3: Int = 0,
+        val x3: Float = 0f,
+        val y3: Float = 0f,
         val n: Int = 0
     )
 
@@ -430,14 +431,15 @@ class Brain(private val base: String, private val key: String, private val model
         val reason: String = "",
         val learn: List<String> = emptyList(),
         val rules: List<String> = emptyList(),
-        val playing: Boolean = false
+        val playing: Boolean = false,
+        val raw: String = ""
     )
 
     fun ask(sys: String, userText: String, imgs: List<ByteArray>, onThink: (String) -> Unit, onAct: (A) -> Unit): S {
         val root = JSONObject()
         root.put("model", model)
         root.put("temperature", 0.15)
-        root.put("max_tokens", 700)
+        root.put("max_tokens", 1100)
         root.put("stream", true)
         if (base.contains("googleapis")) root.put("reasoning_effort", "low")
 
@@ -470,13 +472,19 @@ class Brain(private val base: String, private val key: String, private val model
                 if (!line.startsWith("data:")) continue
                 val payload = line.removePrefix("data:").trim()
                 if (payload == "[DONE]") break
-                val d = try {
-                    JSONObject(payload).getJSONArray("choices").getJSONObject(0)
-                        .optJSONObject("delta")?.optString("content").orEmpty()
-                } catch (e: Exception) {
-                    ""
-                }
-                if (d.isNotEmpty()) parser.feed(d)
+                var ct = ""
+                var rc = ""
+                try {
+                    val delta = JSONObject(payload).getJSONArray("choices").getJSONObject(0)
+                        .optJSONObject("delta")
+                    if (delta != null) {
+                        ct = delta.optString("content").orEmpty()
+                        rc = delta.optString("reasoning_content").orEmpty()
+                        if (rc.isEmpty()) rc = delta.optString("reasoning").orEmpty()
+                    }
+                } catch (e: Exception) {}
+                val chunk = if (ct.isNotEmpty()) ct else rc
+                if (chunk.isNotEmpty()) parser.feed(chunk)
             }
         }
         return parser.finish()
@@ -485,7 +493,7 @@ class Brain(private val base: String, private val key: String, private val model
     fun ping(): String {
         val root = JSONObject()
         root.put("model", model)
-        root.put("max_tokens", 20)
+        root.put("max_tokens", 30)
         root.put("messages", JSONArray().put(JSONObject().put("role", "user").put("content", "ответь: ok")))
         val c = open(base.trimEnd('/') + "/chat/completions", root.toString())
         val t = c.inputStream.bufferedReader().readText()
@@ -498,7 +506,7 @@ class Brain(private val base: String, private val key: String, private val model
         c.requestMethod = "POST"
         c.doOutput = true
         c.connectTimeout = 15000
-        c.readTimeout = 60000
+        c.readTimeout = 90000
         c.setRequestProperty("Content-Type", "application/json")
         c.setRequestProperty("Authorization", "Bearer $key")
         c.outputStream.use { it.write(body.toByteArray()) }
@@ -586,8 +594,20 @@ class Brain(private val base: String, private val key: String, private val model
 
         fun finish(): S {
             val raw = sb.toString()
-            val a = raw.indexOf('{')
-            val b = raw.lastIndexOf('}')
+            var j: JSONObject? = null
+            var from = raw.lastIndexOf('{')
+            var tries = 0
+            val end = raw.lastIndexOf('}')
+            while (from >= 0 && tries < 10 && j == null) {
+                if (end > from) {
+                    try {
+                        val o = JSONObject(raw.substring(from, end + 1))
+                        if (o.has("actions") || o.has("think") || o.has("levelDone")) j = o
+                    } catch (e: Exception) {}
+                }
+                from = raw.lastIndexOf('{', from - 1)
+                tries++
+            }
             var lvl = false
             var done = false
             var reason = ""
@@ -596,38 +616,81 @@ class Brain(private val base: String, private val key: String, private val model
             var learn = emptyList<String>()
             var rules = emptyList<String>()
             var playing = false
-            if (a in 0 until b) {
-                try {
-                    val j = JSONObject(raw.substring(a, b + 1))
-                    think = j.optString("think", "")
-                    lvl = j.optBoolean("levelDone", false)
-                    done = j.optBoolean("done", false)
-                    reason = j.optString("reason", "")
-                    value = j.optInt("value", -1)
-                    playing = j.optBoolean("playing", false)
-                    val arr = j.optJSONArray("learn")
-                    if (arr != null) {
-                        learn = (0 until arr.length()).map { arr.optString(it) }
-                    }
-                    val rr = j.optJSONArray("rules")
-                    if (rr != null) {
-                        rules = (0 until rr.length()).map { rr.optString(it) }
-                    }
-                } catch (e: Exception) {}
+            val o = j
+            if (o != null) {
+                think = o.optString("think", "")
+                lvl = o.optBoolean("levelDone", false)
+                done = o.optBoolean("done", false)
+                reason = o.optString("reason", "")
+                value = o.optInt("value", -1)
+                playing = o.optBoolean("playing", false)
+                val arr = o.optJSONArray("learn")
+                if (arr != null) learn = (0 until arr.length()).map { arr.optString(it) }
+                val rr = o.optJSONArray("rules")
+                if (rr != null) rules = (0 until rr.length()).map { rr.optString(it) }
             }
-            return S(think, out, lvl, value, done, reason, learn, rules, playing)
+            return S(think, out, lvl, value, done, reason, learn, rules, playing, raw.takeLast(400))
+        }
+
+        private fun f(o: JSONObject, vararg keys: String): Float {
+            for (k in keys) {
+                if (o.has(k) && !o.isNull(k)) {
+                    val d = o.optDouble(k, Double.NaN)
+                    if (!d.isNaN()) return d.toFloat()
+                }
+            }
+            return 0f
+        }
+
+        private fun i(o: JSONObject, vararg keys: String): Int {
+            for (k in keys) {
+                if (o.has(k) && !o.isNull(k)) {
+                    val d = o.optDouble(k, Double.NaN)
+                    if (!d.isNaN()) return Math.round(d).toInt()
+                }
+            }
+            return 0
+        }
+
+        private fun norm(t: String, hasEnd: Boolean): String {
+            val s = t.lowercase()
+            return when {
+                s.contains("wiggl") || s.contains("shak") || s.contains("туда") -> "wiggle"
+                s.contains("path") || s.contains("пут") -> "path"
+                s.contains("drag") || s.contains("move") || s.contains("slide") ||
+                    s.contains("перетас") || s.contains("вед") -> if (hasEnd) "drag" else "hold"
+                s.contains("swip") || s.contains("свайп") -> if (hasEnd) "swipe" else "tap"
+                s.contains("hold") || s.contains("long") || s.contains("заж") ||
+                    s.contains("удерж") -> "hold"
+                s.contains("double") || s.contains("двой") -> "double"
+                s.contains("wait") || s.contains("sleep") || s.contains("пауз") ||
+                    s.contains("ждать") -> "wait"
+                s.contains("back") || s.contains("назад") -> "back"
+                s.contains("restart") || s.contains("перезапус") -> "restart"
+                s.contains("tap") || s.contains("click") || s.contains("touch") ||
+                    s.contains("press") || s.contains("наж") || s.contains("клик") -> "tap"
+                else -> if (hasEnd) "drag" else "tap"
+            }
         }
 
         fun parse(json: String): A? = try {
             val o = JSONObject(json)
-            A(
-                o.optString("type", "tap").lowercase(),
-                o.optInt("x"), o.optInt("y"),
-                o.optInt("x2"), o.optInt("y2"),
-                o.optInt("ms"),
-                o.optInt("x3"), o.optInt("y3"),
-                o.optInt("n")
-            )
+            val x = f(o, "x", "x1", "startX", "startx", "fromX", "fromx")
+            val y = f(o, "y", "y1", "startY", "starty", "fromY", "fromy")
+            val x2 = f(o, "x2", "endX", "endx", "toX", "tox", "targetX", "targetx")
+            val y2 = f(o, "y2", "endY", "endy", "toY", "toy", "targetY", "targety")
+            val x3 = f(o, "x3", "midX", "midx")
+            val y3 = f(o, "y3", "midY", "midy")
+            val ms = i(o, "ms", "duration", "dur", "time")
+            val n = i(o, "n", "times", "count", "repeat")
+            val rawT = o.optString("type", "")
+                .ifBlank { o.optString("action", "") }
+                .ifBlank { o.optString("t", "tap") }
+            val hasEnd = x2 != 0f || y2 != 0f
+            val t = norm(rawT, hasEnd)
+            var m = ms
+            if (t == "wait" && m <= 0) m = 800
+            A(t, x, y, x2, y2, m, x3, y3, n)
         } catch (e: Exception) {
             null
         }
@@ -691,7 +754,7 @@ class Ovl(private val ctx: Context) {
             text = "AutoPilot: старт…"
             setTextColor(Color.WHITE)
             textSize = 11f
-            maxWidth = 520
+            maxWidth = 700
             setOnClickListener { onPause() }
         }
         val pa = TextView(ctx).apply {
@@ -788,6 +851,7 @@ class AutoPilotService : Service() {
         @Volatile var inst: AutoPilotService? = null
         @Volatile var stepsLive = 0
         @Volatile var levelsLive = 0
+        @Volatile var lastReply = ""
     }
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -830,7 +894,10 @@ class AutoPilotService : Service() {
     private var steps = 0
     private var errors = 0
     private var lastFrameAt = 0L
-    private var black = 0
+    private var lastActAt = 0L
+    private var prevSig = 0L
+    private var frozen = 0
+    private var awaySince = 0L
     private var stopped = false
     private var awayNotified = false
 
@@ -908,6 +975,7 @@ class AutoPilotService : Service() {
 
         running.set(true)
         startedAt = SystemClock.elapsedRealtime()
+        lastActAt = startedAt
 
         val sp = P.sp(this)
         val brain = Brain(
@@ -945,16 +1013,22 @@ class AutoPilotService : Service() {
 
     private fun gameVisible(): Boolean {
         val f = TouchService.foregroundPkg
-        if (f.isEmpty()) return true
-        if (f == pkg) return true
-        if (f == packageName) return true
-        return false
+        val vis = f.isEmpty() || f == pkg || f == packageName
+        if (vis) {
+            awaySince = 0L
+            return true
+        }
+        if (awaySince == 0L) awaySince = SystemClock.elapsedRealtime()
+        return SystemClock.elapsedRealtime() - awaySince > 5000
     }
 
     private fun ai(brain: Brain, cadence: Long) {
         actor = scope.launch { actorLoop() }
         thinker = scope.launch { thinkLoop(brain, cadence) }
     }
+
+    private fun px(v: Float, size: Int): Float =
+        if (v > 0f && v <= 1f) v * size else v
 
     private suspend fun actorLoop() {
         val sx = scrW.toFloat() / imgW
@@ -969,13 +1043,16 @@ class AutoPilotService : Service() {
             while (paused && running.get()) delay(80)
             if (!running.get()) return
             val t = TouchService.inst
-            val ax = a.x * sx
-            val ay = (a.y + zoneY0) * sy
-            val bx = a.x2 * sx
-            val by = (a.y2 + zoneY0) * sy
+            val ax = px(a.x, imgW) * sx
+            val ay = (px(a.y, imgH) + zoneY0) * sy
+            val bx = px(a.x2, imgW) * sx
+            val by = (px(a.y2, imgH) + zoneY0) * sy
             when (a.t) {
                 "tap" -> {
-                    if (t != null) t.tap(ax, ay)
+                    if (t != null) {
+                        if (a.ms > 60) t.hold(ax, ay, a.ms.toLong().coerceIn(80L, 4000L))
+                        else t.tap(ax, ay)
+                    }
                     note(a.x, a.y)
                 }
                 "double" -> {
@@ -999,8 +1076,8 @@ class AutoPilotService : Service() {
                         val pts = ArrayList<Pair<Float, Float>>(3)
                         pts.add(ax to ay)
                         pts.add(bx to by)
-                        if (a.x3 != 0 || a.y3 != 0) {
-                            pts.add(a.x3 * sx to (a.y3 + zoneY0) * sy)
+                        if (a.x3 != 0f || a.y3 != 0f) {
+                            pts.add(px(a.x3, imgW) * sx to (px(a.y3, imgH) + zoneY0) * sy)
                         }
                         t.pathMove(pts, a.ms.toLong().coerceIn(200L, 4000L))
                     }
@@ -1023,17 +1100,20 @@ class AutoPilotService : Service() {
                     delay(3200)
                 }
             }
+            lastActAt = SystemClock.elapsedRealtime()
             pending.decrementAndGet()
             delay(60)
         }
     }
 
-    private fun note(x: Int, y: Int) {
-        lastTap = x to y
+    private fun note(x: Float, y: Float) {
+        val xi = x.roundToInt()
+        val yi = y.roundToInt()
+        lastTap = xi to yi
         val now = SystemClock.elapsedRealtime()
         val d = if (lastLvlTap == 0L) 400 else (now - lastLvlTap).toInt()
         lastLvlTap = now
-        if (lvlTaps.size < 200) lvlTaps.add(Mac.T(x, y, d.coerceIn(40, 4000), false))
+        if (lvlTaps.size < 200) lvlTaps.add(Mac.T(xi, yi, d.coerceIn(40, 4000), false))
     }
 
     private fun tapImg(x: Int, y: Int) {
@@ -1042,6 +1122,7 @@ class AutoPilotService : Service() {
         val sy = scrH.toFloat() / imgH
         t.tap(x * sx, y * sy)
         lastTap = x to y
+        lastActAt = SystemClock.elapsedRealtime()
     }
 
     private fun zone(f: Bitmap): Bitmap {
@@ -1057,12 +1138,15 @@ class AutoPilotService : Service() {
 
     private suspend fun entryLoop(brain: Brain, cadence: Long) {
         set("сам ищу кнопку старта…")
+        val t0 = SystemClock.elapsedRealtime()
         var n = 0
         var idleSteps = 0
-        while (scope.isActive && running.get() && n < 16) {
+        while (scope.isActive && running.get() && n < 20 &&
+            SystemClock.elapsedRealtime() - t0 < 50000L
+        ) {
+            n++
             if (paused) { delay(150); continue }
             if (!gameVisible()) { delay(300); continue }
-            n++
             val full = cap?.frame()
             if (full == null) {
                 if (SystemClock.elapsedRealtime() - lastFrameAt > 7000) cap?.recreate()
@@ -1071,15 +1155,6 @@ class AutoPilotService : Service() {
             }
             lastFrameAt = SystemClock.elapsedRealtime()
             val f = zone(full)
-            val cur = signature(f)
-            if (cur == 0L) black++ else black = 0
-            if (black > 45) {
-                black = 0
-                launchGame()
-                delay(3000)
-                continue
-            }
-
             val drawn = Gr.draw(f)
             val acts = ArrayList<Brain.A>()
             var res: Brain.S? = null
@@ -1088,7 +1163,7 @@ class AutoPilotService : Service() {
                     entrySystem(),
                     "Вход в игру, попытка $n. Что нажать, чтобы начать играть?",
                     listOf(drawn.toJpg(70)),
-                    { th -> set(th.take(70)) },
+                    { th -> set("вход: " + th.take(60)) },
                     { a ->
                         acts.add(a)
                         pending.incrementAndGet()
@@ -1101,16 +1176,18 @@ class AutoPilotService : Service() {
                     set("лимит запросов — пауза 10с")
                     delay(10000)
                 } else {
-                    set("ошибка ИИ на входе")
+                    set("ошибка ИИ на входе: " + em.take(40))
                 }
                 delay(1200)
                 continue
             }
 
-            val dl = SystemClock.elapsedRealtime() + 10000
+            lastReply = res.raw
+
+            val dl = SystemClock.elapsedRealtime() + 12000
             while (pending.get() > 0 && SystemClock.elapsedRealtime() < dl) delay(40)
 
-            if (res != null && res.playing) {
+            if (res.playing) {
                 set("игра началась")
                 delay(400)
                 return
@@ -1121,7 +1198,7 @@ class AutoPilotService : Service() {
                 if (idleSteps >= 2) {
                     tapImg(imgW / 2, zoneY0 + (viewH * 0.72).toInt())
                     idleSteps = 0
-                    set("сам жму центр")
+                    set("вход: сам жму центр")
                 }
             } else {
                 idleSteps = 0
@@ -1142,6 +1219,7 @@ class AutoPilotService : Service() {
             entryLoop(brain, cadence)
         }
         lastSig = 0L
+        prevSig = 0L
 
         while (scope.isActive && running.get()) {
             if (paused) {
@@ -1167,6 +1245,12 @@ class AutoPilotService : Service() {
             }
             awayNotified = false
 
+            // пульс: нет действий дольше 6 секунд — сам тапаю
+            if (SystemClock.elapsedRealtime() - lastActAt > 6000L) {
+                tapImg(imgW / 2, zoneY0 + (viewH * 0.7).toInt())
+                set("нет действий 6с — сам тапаю")
+            }
+
             val full = cap?.frame()
             if (full == null) {
                 if (SystemClock.elapsedRealtime() - lastFrameAt > 7000) cap?.recreate()
@@ -1178,9 +1262,11 @@ class AutoPilotService : Service() {
             val f = zone(full)
 
             val cur = signature(f)
-            if (cur == 0L) black++ else black = 0
-            if (black > 45) {
-                black = 0
+            if (cur == prevSig) frozen++ else frozen = 0
+            prevSig = cur
+            if (frozen > 90) {
+                frozen = 0
+                set("кадр застыл — перезапуск игры")
                 launchGame()
                 delay(3000)
                 continue
@@ -1216,7 +1302,7 @@ class AutoPilotService : Service() {
                     system(),
                     userPrompt(noOp),
                     imgs,
-                    { th -> set(th.take(70)) },
+                    { th -> set("думает: " + th.take(55)) },
                     { a ->
                         pending.incrementAndGet()
                         queue.trySend(a)
@@ -1229,7 +1315,7 @@ class AutoPilotService : Service() {
                     set("лимит запросов — пауза 10с")
                     delay(10000)
                 } else {
-                    set("ошибка ИИ ($errors)")
+                    set("ошибка ИИ: " + em.take(40))
                 }
                 if (errors >= 5 && Mac.load(this, pkg).isNotEmpty()) {
                     set("перехожу на макрос")
@@ -1241,6 +1327,7 @@ class AutoPilotService : Service() {
 
             val r = res
             if (r == null) continue
+            lastReply = r.raw
 
             steps++
             stepsLive = steps
@@ -1271,9 +1358,9 @@ class AutoPilotService : Service() {
                 }
             }
 
-            val dl = SystemClock.elapsedRealtime() + 14000
+            val dl = SystemClock.elapsedRealtime() + 16000
             while (pending.get() > 0 && SystemClock.elapsedRealtime() < dl) delay(40)
-            delay(220)
+            delay(200)
 
             val after = cap?.frame()?.let { signature(zone(it)) } ?: 0L
             var hadTap = false
@@ -1285,6 +1372,15 @@ class AutoPilotService : Service() {
                 }
             }
             noOp = if (hadTap && ham(before, after) <= 3) (noOp + 1).coerceAtMost(6) else 0
+
+            if (r.acts.isEmpty()) {
+                set("шаг $steps: ИИ молчит — сам тапаю")
+                tapImg(imgW / 2, zoneY0 + (viewH * 0.6).toInt())
+            } else if (!hadTap) {
+                set("шаг $steps: ${r.acts[0].t} (${r.acts.size})")
+            } else {
+                set("шаг $steps: ${r.acts.size} действ. ${r.acts[0].t}")
+            }
 
             if (noOp == 2) {
                 tapImg(imgW / 2, zoneY0 + (viewH * 0.78).toInt())
@@ -1387,7 +1483,9 @@ class AutoPilotService : Service() {
         sb.append("• Резкий бросок/удар: swipe {x,y,x2,y2,ms} с маленьким ms (150).\n")
         sb.append("• Ведро/корзина с падающими предметами: держи палец НА ведре и веди его ПОД хороший предмет (drag или path). Опасное — пропускай или уводи ведро в сторону.\n")
         sb.append("• Персонаж-раннер: держи палец и води влево-вправо, чтобы уклоняться (wiggle или серия drag).\n")
-        sb.append("• Если объект должен ДВИГАТЬСЯ — не тапай по нему несколько раз, а ВЕДИ его. Повторный тап по тому же месту ничего не меняет.\n")
+        sb.append("• Если объект должен ДВИГАТЬСЯ — не тапай по нему несколько раз, а ВЕДИ его.\n")
+        sb.append("• Поле type пиши строго одним из слов: tap, hold, drag, path, wiggle, swipe, wait, back, restart. Никаких click/move/press.\n")
+        sb.append("• Координаты пиши целыми числами в пикселях картинки, например \"x\": 270, \"y\": 1180.\n")
         sb.append("• Определи тип управления игры и запиши это в rules один раз, например: «управление: вести ведро влево-вправо».\n")
         return sb.toString()
     }
@@ -1409,7 +1507,7 @@ class AutoPilotService : Service() {
         sb.append("Если игра уже идёт (видно поле, персонажа, счёт) — поставь \"playing\": true и ничего не жми.\n")
         sb.append("Если идёт загрузка (крутится колёсико, полоса прогресса) — wait 1200 и \"playing\": false.\n")
         sb.append("\nОТВЕТ СТРОГО JSON: {\"think\":\"что вижу и что жму\",\"actions\":[{...}],\"playing\":false}\n")
-        sb.append("Действия: tap {x,y} | hold {x,y,ms} | drag {x,y,x2,y2,ms} | path {x,y,x2,y2,x3,y3,ms} | wiggle {x,y,x2,y2,n,ms} | swipe {x,y,x2,y2,ms} | wait {ms} | back\n")
+        sb.append("Пример: {\"think\":\"вижу кнопку Play\",\"actions\":[{\"type\":\"tap\",\"x\":270,\"y\":1180}],\"playing\":false}\n")
         sb.append("Максимум 2 действия. Пустой actions не возвращай: не уверен — wait 800.\n")
         return sb.toString()
     }
@@ -1446,13 +1544,15 @@ class AutoPilotService : Service() {
         sb.append(control())
 
         sb.append("\nОТВЕЧАЙ СТРОГО JSON, порядок ключей: think, actions, levelDone, value, done, reason, learn, rules\n")
-        sb.append("{\"think\":\"что видишь и делаешь\",\"actions\":[{...}],\"levelDone\":false,\"value\":-1,\"done\":false,\"reason\":\"\",\"learn\":[],\"rules\":[]}\n\n")
-        sb.append("Действия: tap {x,y} | double {x,y} | hold {x,y,ms} | swipe {x,y,x2,y2,ms} | drag {x,y,x2,y2,ms} | path {x,y,x2,y2,x3,y3,ms} | wiggle {x,y,x2,y2,n,ms} | wait {ms} | back | restart\n\n")
+        sb.append("{\"think\":\"что видишь и делаешь\",\"actions\":[{...}],\"levelDone\":false,\"value\":-1,\"done\":false,\"reason\":\"\",\"learn\":[],\"rules\":[]}\n")
+        sb.append("Пример действия: {\"type\":\"tap\",\"x\":270,\"y\":1180} или {\"type\":\"drag\",\"x\":200,\"y\":1500,\"x2\":700,\"y2\":1500,\"ms\":400}\n\n")
+        sb.append("Поле type строго из списка: tap, double, hold, swipe, drag, path, wiggle, wait, back, restart.\n")
+        sb.append("Координаты — целые числа в пикселях картинки 1.\n\n")
         if (target > 0) {
             sb.append("=== ГЛАВНАЯ ЧИСЛОВАЯ ЦЕЛЬ ===\n")
             sb.append("Показатель, за которым надо следить: «$metric». Целевое значение: $target.\n")
             sb.append("В КАЖДОМ ответе заполняй поле \"value\" — текущее значение этого показателя, ТОЛЬКО ЦИФРЫ, без букв, пробелов и знаков (например 1240). Если показатель на экране не виден — \"value\": -1.\n")
-            sb.append("Играй так, чтобы этот показатель рос: зарабатывай ресурсы и трать их на прокачку именно этого показателя. Если показатель уменьшился (потратил) — это нормально, следи, чтобы он в итоге рос.\n")
+            sb.append("Играй так, чтобы этот показатель рос: зарабатывай ресурсы и трать их на прокачку именно этого показателя.\n")
             sb.append("Когда показатель станет $target или больше — поставь \"done\": true и в \"reason\" напиши достигнутое значение.\n\n")
         }
         sb.append("ПРАВИЛА РАБОТЫ:\n")
@@ -1729,7 +1829,7 @@ class MainActivity : Activity() {
         selLabel = txt("Выбрано: —", 14f, true)
         gamesPane.addView(selLabel)
 
-        status = txt("статус: не запущен", 12f, false)
+        status = txt("статус: не запущен", 11f, false)
         gamesPane.addView(status)
 
         val rowRun = LinearLayout(this)
@@ -1994,7 +2094,7 @@ class MainActivity : Activity() {
                 status.text = if (AutoPilotService.inst == null) {
                     "статус: не запущен"
                 } else {
-                    "работает: шагов ${AutoPilotService.stepsLive}, уровней ${AutoPilotService.levelsLive}"
+                    "шагов ${AutoPilotService.stepsLive}, уровней ${AutoPilotService.levelsLive}\nИИ: ${AutoPilotService.lastReply.takeLast(90)}"
                 }
                 h.postDelayed(this, 700)
             }
